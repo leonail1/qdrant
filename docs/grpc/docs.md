@@ -167,6 +167,9 @@
     - [FacetHit](#qdrant-FacetHit)
     - [FacetResponse](#qdrant-FacetResponse)
     - [FacetValue](#qdrant-FacetValue)
+    - [FeedbackInput](#qdrant-FeedbackInput)
+    - [FeedbackItem](#qdrant-FeedbackItem)
+    - [FeedbackStrategy](#qdrant-FeedbackStrategy)
     - [FieldCondition](#qdrant-FieldCondition)
     - [Filter](#qdrant-Filter)
     - [Formula](#qdrant-Formula)
@@ -272,6 +275,7 @@
     - [SetPayloadPoints](#qdrant-SetPayloadPoints)
     - [SetPayloadPoints.PayloadEntry](#qdrant-SetPayloadPoints-PayloadEntry)
     - [ShardKeySelector](#qdrant-ShardKeySelector)
+    - [SimpleFeedbackStrategy](#qdrant-SimpleFeedbackStrategy)
     - [SparseIndices](#qdrant-SparseIndices)
     - [SparseVector](#qdrant-SparseVector)
     - [StartFrom](#qdrant-StartFrom)
@@ -2989,6 +2993,54 @@ The JSON representation for `Value` is a JSON value.
 
 
 
+<a name="qdrant-FeedbackInput"></a>
+
+### FeedbackInput
+
+
+
+| Field | Type | Label | Description |
+| ----- | ---- | ----- | ----------- |
+| target | [VectorInput](#qdrant-VectorInput) |  | The original query vector |
+| feedback | [FeedbackItem](#qdrant-FeedbackItem) | repeated | Previous results scored by the feedback provider. |
+| strategy | [FeedbackStrategy](#qdrant-FeedbackStrategy) |  | Formula and trained coefficients to use. |
+
+
+
+
+
+
+<a name="qdrant-FeedbackItem"></a>
+
+### FeedbackItem
+
+
+
+| Field | Type | Label | Description |
+| ----- | ---- | ----- | ----------- |
+| vector | [VectorInput](#qdrant-VectorInput) |  | The id or vector from the original model |
+| score | [float](#float) |  | Score for this vector as determined by the feedback provider |
+
+
+
+
+
+
+<a name="qdrant-FeedbackStrategy"></a>
+
+### FeedbackStrategy
+
+
+
+| Field | Type | Label | Description |
+| ----- | ---- | ----- | ----------- |
+| simple | [SimpleFeedbackStrategy](#qdrant-SimpleFeedbackStrategy) |  | a * score &#43; sim(confidence^b * c * delta) |
+
+
+
+
+
+
 <a name="qdrant-FieldCondition"></a>
 
 ### FieldCondition
@@ -4087,6 +4139,7 @@ For example, if `oversampling` is 2.4 and `limit` is 100, then 240 vectors will 
 | formula | [Formula](#qdrant-Formula) |  | Score boosting via an arbitrary formula |
 | nearest_with_mmr | [NearestInputWithMmr](#qdrant-NearestInputWithMmr) |  | Search nearest neighbors, but re-rank based on the Maximal Marginal Relevance algorithm. |
 | rrf | [Rrf](#qdrant-Rrf) |  | Parameterized reciprocal rank fusion |
+| feedback | [FeedbackInput](#qdrant-FeedbackInput) |  | Search with feedback from some oracle. |
 
 
 
@@ -4864,6 +4917,23 @@ Parameterized reciprocal rank fusion
 | Field | Type | Label | Description |
 | ----- | ---- | ----- | ----------- |
 | shard_keys | [ShardKey](#qdrant-ShardKey) | repeated | List of shard keys which should be used in the request |
+
+
+
+
+
+
+<a name="qdrant-SimpleFeedbackStrategy"></a>
+
+### SimpleFeedbackStrategy
+
+
+
+| Field | Type | Label | Description |
+| ----- | ---- | ----- | ----------- |
+| a | [float](#float) |  |  |
+| b | [float](#float) |  |  |
+| c | [float](#float) |  |  |
 
 
 
