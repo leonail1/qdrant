@@ -38,7 +38,7 @@ fn hnsw_benchmark(c: &mut Criterion) {
 
             black_box(
                 graph_layers
-                    .search(TOP, EF, scorer, None, &DEFAULT_STOPPED)
+                    .search(TOP, EF, None, scorer, None, &DEFAULT_STOPPED)
                     .unwrap(),
             );
         })
@@ -54,7 +54,7 @@ fn hnsw_benchmark(c: &mut Criterion) {
 
             black_box(
                 graph_layers
-                    .search(TOP, EF, scorer, None, &DEFAULT_STOPPED)
+                    .search(TOP, EF, None, scorer, None, &DEFAULT_STOPPED)
                     .unwrap(),
             );
         })

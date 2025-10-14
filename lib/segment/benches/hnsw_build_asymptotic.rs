@@ -38,7 +38,7 @@ fn hnsw_build_asymptotic(c: &mut Criterion) {
             let query = random_vector(&mut rng, DIM);
             let scorer = vector_holder.scorer(query);
             graph_layers
-                .search(TOP, EF, scorer, None, &DEFAULT_STOPPED)
+                .search(TOP, EF, None, scorer, None, &DEFAULT_STOPPED)
                 .unwrap();
         })
     });
@@ -57,7 +57,7 @@ fn hnsw_build_asymptotic(c: &mut Criterion) {
             let query = random_vector(&mut rng, DIM);
             let scorer = vector_holder.scorer(query);
             graph_layers
-                .search(TOP, EF, scorer, None, &DEFAULT_STOPPED)
+                .search(TOP, EF, None, scorer, None, &DEFAULT_STOPPED)
                 .unwrap();
         })
     });

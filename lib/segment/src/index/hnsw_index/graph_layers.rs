@@ -476,6 +476,7 @@ impl GraphLayers {
         &self,
         top: usize,
         ef: usize,
+        acorn_limit_factor: Option<f64>,
         mut points_scorer: FilteredScorer,
         custom_entry_points: Option<&[PointOffsetType]>,
         is_stopped: &AtomicBool,
@@ -492,13 +493,18 @@ impl GraphLayers {
             &mut points_scorer,
             is_stopped,
         )?;
-        let nearest = self.search_on_level(
-            zero_level_entry,
-            0,
-            max(top, ef),
-            &mut points_scorer,
-            is_stopped,
-        )?;
+        let ef = max(ef, top);
+        let nearest = match acorn_limit_factor {
+            None => self.search_on_level(zero_level_entry, 0, ef, &mut points_scorer, is_stopped),
+            Some(acorn_limit_factor) => self.search_on_level_acorn(
+                zero_level_entry,
+                0,
+                ef,
+                &mut points_scorer,
+                is_stopped,
+                acorn_limit_factor,
+            ),
+        }?;
         Ok(nearest.into_iter_sorted().take(top).collect_vec())
     }
 
@@ -681,7 +687,7 @@ mod tests {
 
         let ef = 16;
         graph
-            .search(top, ef, scorer, None, &DEFAULT_STOPPED)
+            .search(top, ef, None, scorer, None, &DEFAULT_STOPPED)
             .unwrap()
     }
 

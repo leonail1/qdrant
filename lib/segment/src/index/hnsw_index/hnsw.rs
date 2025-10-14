@@ -951,6 +951,9 @@ impl HNSWIndex {
         let ef = params
             .and_then(|params| params.hnsw_ef)
             .unwrap_or(self.config.ef);
+        let acorn_limit_factor = params
+            .and_then(|params| params.acorn_limit_factor)
+            .map(|v| v.into_inner());
 
         let is_stopped = vector_query_context.is_stopped();
 
@@ -1024,6 +1027,7 @@ impl HNSWIndex {
             let search_result = self.graph.search(
                 oversampled_top,
                 ef,
+                acorn_limit_factor,
                 points_scorer,
                 custom_entry_points,
                 &is_stopped,

@@ -214,13 +214,13 @@ mod tests {
             let scorer = test.vector_holder.scorer(search_vector.clone());
 
             let search_result_gpu = graph
-                .search(top, ef, scorer, None, &DEFAULT_STOPPED)
+                .search(top, ef, None, scorer, None, &DEFAULT_STOPPED)
                 .unwrap();
 
             let scorer = test.vector_holder.scorer(search_vector.clone());
 
             let search_result_cpu = ref_graph
-                .search(top, ef, scorer, None, &DEFAULT_STOPPED)
+                .search(top, ef, None, scorer, None, &DEFAULT_STOPPED)
                 .unwrap();
 
             let mut gpu_set = HashSet::default();
