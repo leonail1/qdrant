@@ -1,3 +1,29 @@
+//! # Search on level functions
+//!
+//! This module contains multiple variations of the SEARCH-LAYER function.
+//! All of them implement a beam (greedy) search for closest points within a
+//! single graph layer.
+//!
+//! - [`GraphLayersBase::search_on_level`]
+//!   Regular search, as described in the original HNSW paper.
+//!   Usually used on layer 0.
+//!
+//! - [`GraphLayersBase::search_on_level_acorn`]
+//!   Variation of `search_on_level` that implements the ACORN-1 algorithm.
+//!   Usually used on layer 0.
+//!
+//! - [`GraphLayersBase::search_entry_on_level`]
+//!   Simplified version of `search_on_level` that uses beam size of 1.
+//!   Usually used on all levels above level 0.
+//!
+//! - [`GraphLayersWithVectors::search_on_level_with_vectors`]
+//!   Like `search_on_level`, but for graphs with [inline storage].
+//!
+//! - [`GraphLayersWithVectors::search_entry_on_level_with_vectors`]
+//!   Like `search_entry_on_level`, but for graphs with [inline storage].
+//!
+//! [inline storage]: crate::types::HnswConfig::inline_storage
+
 use std::borrow::Cow;
 use std::cmp::max;
 use std::ops::ControlFlow;
@@ -70,7 +96,9 @@ pub trait GraphLayersBase {
     /// Get M based on current level
     fn get_m(&self, level: usize) -> usize;
 
-    /// Greedy search for closest points within a single graph layer
+    /// Beam search for closest points within a single graph layer.
+    ///
+    /// See [module docs](self) for comparison with other search functions.
     fn search_on_level(
         &self,
         level_entry: ScoredPointOffset,
@@ -115,6 +143,8 @@ pub trait GraphLayersBase {
 
     /// Variation of [`GraphLayersBase::search_on_level`] that implements the
     /// ACORN-1 algorithm.
+    ///
+    /// See [module docs](self) for comparison with other search functions.
     fn search_on_level_acorn(
         &self,
         level_entry: ScoredPointOffset,
@@ -225,6 +255,9 @@ pub trait GraphLayersBase {
         }
     }
 
+    /// Simplified version of `search_on_level` that uses beam size of 1.
+    ///
+    /// See [module docs](self) for comparison with other search functions.
     fn search_entry_on_level(
         &self,
         entry_point: PointOffsetType,
@@ -280,6 +313,8 @@ pub trait GraphLayersWithVectors: GraphLayersBase {
     ) -> (&[u8], impl Iterator<Item = (PointOffsetType, &[u8])> + '_);
 
     /// Similar to [`GraphLayersBase::search_on_level`].
+    ///
+    /// See [module docs](self) for comparison with other search functions.
     fn search_on_level_with_vectors(
         &self,
         level_entry: ScoredPointOffset,
@@ -362,6 +397,8 @@ pub trait GraphLayersWithVectors: GraphLayersBase {
     }
 
     /// Similar to [`GraphLayersBase::search_entry_on_level`].
+    ///
+    /// See [module docs](self) for comparison with other search functions.
     fn search_entry_on_level_with_vectors<'a>(
         &'a self,
         entry_point: ScoredPointOffset,
