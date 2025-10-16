@@ -4867,6 +4867,8 @@ pub struct SearchParams {
     /// guarantee that all uploaded vectors will be included in search results
     #[prost(bool, optional, tag = "4")]
     pub indexed_only: ::core::option::Option<bool>,
+    #[prost(double, optional, tag = "5")]
+    pub acorn_limit_factor: ::core::option::Option<f64>,
 }
 #[derive(validator::Validate)]
 #[derive(serde::Serialize)]

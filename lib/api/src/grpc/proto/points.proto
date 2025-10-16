@@ -330,6 +330,8 @@ message SearchParams {
   guarantee that all uploaded vectors will be included in search results
   */
   optional bool indexed_only = 4;
+
+  optional double acorn_limit_factor = 5;
 }
 
 message SearchPoints {

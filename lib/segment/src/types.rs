@@ -534,6 +534,10 @@ pub struct SearchParams {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub hnsw_ef: Option<usize>,
 
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[validate(range(min = 1.0))]
+    pub acorn_limit_factor: Option<OrderedFloat<f64>>,
+
     /// Search without approximation. If set to true, search may run long but with exact results.
     #[serde(default)]
     pub exact: bool,

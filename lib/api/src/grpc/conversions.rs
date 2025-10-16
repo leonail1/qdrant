@@ -8,6 +8,7 @@ use common::counter::hardware_accumulator::HwMeasurementAcc;
 use common::counter::hardware_data::HardwareData;
 use common::types::ScoreType;
 use itertools::Itertools;
+use ordered_float::OrderedFloat;
 use segment::common::operation_error::OperationError;
 use segment::data_types::index::{
     BoolIndexType, DatetimeIndexType, FloatIndexType, GeoIndexType, IntegerIndexType,
@@ -793,12 +794,14 @@ impl From<SearchParams> for segment::types::SearchParams {
             exact,
             quantization,
             indexed_only,
+            acorn_limit_factor,
         } = params;
         Self {
             hnsw_ef: hnsw_ef.map(|x| x as usize),
             exact: exact.unwrap_or(false),
             quantization: quantization.map(|q| q.into()),
             indexed_only: indexed_only.unwrap_or(false),
+            acorn_limit_factor: acorn_limit_factor.map(OrderedFloat::from),
         }
     }
 }
@@ -810,12 +813,14 @@ impl From<segment::types::SearchParams> for SearchParams {
             exact,
             quantization,
             indexed_only,
+            acorn_limit_factor,
         } = params;
         Self {
             hnsw_ef: hnsw_ef.map(|x| x as u64),
             exact: Some(exact),
             quantization: quantization.map(|q| q.into()),
             indexed_only: Some(indexed_only),
+            acorn_limit_factor: acorn_limit_factor.map(OrderedFloat::into_inner),
         }
     }
 }

@@ -4738,6 +4738,7 @@ Parameterized reciprocal rank fusion
 | exact | [bool](#bool) | optional | Search without approximation. If set to true, search may run long but with exact results. |
 | quantization | [QuantizationSearchParams](#qdrant-QuantizationSearchParams) | optional | If set to true, search will ignore quantized vector data |
 | indexed_only | [bool](#bool) | optional | If enabled, the engine will only perform search among indexed or small segments. Using this option prevents slow searches in case of delayed index, but does not guarantee that all uploaded vectors will be included in search results |
+| acorn_limit_factor | [double](#double) | optional |  |
 
 
 
