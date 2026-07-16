@@ -16,8 +16,8 @@ use super::MapIndex;
 use super::key::MapIndexKey;
 use super::read_ops::MapIndexRead;
 use crate::index::field_index::{
-    CardinalityEstimation, FieldIndexBuilderTrait, PayloadFieldIndex, PayloadFieldIndexRead,
-    ValueIndexer,
+    CardinalityEstimation, FieldIndexBuilderTrait, IntegerPostingAtom, PayloadFieldIndex,
+    PayloadFieldIndexRead, ValueIndexer,
 };
 use crate::types::{IntPayloadType, PayloadKeyType, UuidIntType};
 
@@ -207,6 +207,82 @@ fn test_int_disk_map_index(#[case] index_type: IndexType) {
             .except_cardinality(std::iter::empty(), &hw_counter)
             .equals_min_exp_max(&CardinalityEstimation::exact(0))
     );
+}
+
+#[rstest]
+#[case(IndexType::MutableGridstore)]
+#[case(IndexType::Mmap)]
+#[case(IndexType::RamMmap)]
+fn test_batched_integer_postings_preserve_atom_order(#[case] index_type: IndexType) {
+    // Keep every fixture point indexed because the shared load helper
+    // intentionally unwraps `get_values`. The absent requested value 42 still
+    // exercises the empty-posting case without conflating it with an
+    // unindexed point.
+    let data = vec![vec![7], vec![3], vec![7], vec![9]];
+    let temp_dir = Builder::new().prefix("store_dir").tempdir().unwrap();
+    save_map_index::<IntPayloadType>(&data, temp_dir.path(), index_type, |v| (*v).into());
+    let index = load_map_index::<IntPayloadType>(&data, temp_dir.path(), index_type);
+    let hw_counter = HardwareCounterCell::new();
+
+    let batch = index
+        .batched_integer_postings(
+            &[
+                IntegerPostingAtom::new(9, 0b1000),
+                IntegerPostingAtom::new(42, 0b0100),
+                IntegerPostingAtom::new(7, 0b0001),
+                IntegerPostingAtom::new(3, 0b0010),
+            ],
+            &hw_counter,
+        )
+        .unwrap();
+
+    assert!(batch.single_valued);
+    assert_eq!(
+        batch
+            .postings
+            .iter()
+            .map(|posting| (posting.query_mask, posting.point_ids.as_slice()))
+            .collect::<Vec<_>>(),
+        vec![
+            (0b1000, &[3][..]),
+            (0b0100, &[][..]),
+            (0b0001, &[0, 2][..]),
+            (0b0010, &[1][..]),
+        ],
+    );
+    assert_eq!(
+        hw_counter.payload_index_io_read_counter().get() > 0,
+        index_type == IndexType::Mmap,
+    );
+}
+
+#[rstest]
+#[case(IndexType::MutableGridstore)]
+#[case(IndexType::Mmap)]
+#[case(IndexType::RamMmap)]
+fn test_batched_integer_postings_filter_deletions_and_detect_multi_value(
+    #[case] index_type: IndexType,
+) {
+    let data = vec![vec![1, 2], vec![1], vec![2], vec![1, 2]];
+    let temp_dir = Builder::new().prefix("store_dir").tempdir().unwrap();
+    save_map_index::<IntPayloadType>(&data, temp_dir.path(), index_type, |v| (*v).into());
+    let mut index = load_map_index::<IntPayloadType>(&data, temp_dir.path(), index_type);
+    index.remove_point(3).unwrap();
+    let hw_counter = HardwareCounterCell::new();
+
+    let batch = index
+        .batched_integer_postings(
+            &[
+                IntegerPostingAtom::new(2, 0b10),
+                IntegerPostingAtom::new(1, 0b01),
+            ],
+            &hw_counter,
+        )
+        .unwrap();
+
+    assert!(!batch.single_valued);
+    assert_eq!(batch.postings[0].point_ids, vec![0, 2]);
+    assert_eq!(batch.postings[1].point_ids, vec![0, 1]);
 }
 
 #[rstest]

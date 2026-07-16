@@ -1,3 +1,4 @@
+pub mod factorized_exact;
 pub mod field_index;
 pub mod hnsw_index;
 mod key_encoding;

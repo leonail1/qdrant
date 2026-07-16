@@ -11,6 +11,7 @@ use super::{IdIter, MapIndex};
 use crate::common::operation_error::OperationResult;
 use crate::index::field_index::CardinalityEstimation;
 use crate::index::field_index::stat_tools::number_of_selected_points;
+use crate::index::field_index::{IntegerPosting, IntegerPostingAtom, IntegerPostingBatch};
 use crate::index::payload_config::{IndexMutability, StorageType};
 use crate::telemetry::PayloadIndexTelemetry;
 
@@ -412,4 +413,52 @@ where
             Self::Mmap(index) => index.storage_type(),
         }
     }
+}
+
+impl MapIndex<crate::types::IntPayloadType> {
+    /// Fetch integer postings in one logical batch.
+    ///
+    /// Mutable and RAM-immutable variants already have in-memory lookup
+    /// structures, so they iterate atoms sequentially. The storage-backed
+    /// mmap variant overrides that behavior with one persisted-hashmap
+    /// pipeline.
+    pub fn batched_integer_postings(
+        &self,
+        atoms: &[IntegerPostingAtom],
+        hw_counter: &HardwareCounterCell,
+    ) -> OperationResult<IntegerPostingBatch> {
+        let single_valued =
+            MapIndexRead::get_values_count(self) == MapIndexRead::get_indexed_points(self);
+
+        let postings = match self {
+            MapIndex::Mutable(index) => {
+                collect_integer_postings_sequential(index, atoms, hw_counter)
+            }
+            MapIndex::Immutable(index) => {
+                collect_integer_postings_sequential(index, atoms, hw_counter)
+            }
+            MapIndex::Mmap(index) => {
+                return index.batched_integer_postings(atoms, hw_counter, single_valued);
+            }
+        };
+
+        Ok(IntegerPostingBatch {
+            postings,
+            single_valued,
+        })
+    }
+}
+
+pub(super) fn collect_integer_postings_sequential(
+    index: &impl MapIndexRead<crate::types::IntPayloadType>,
+    atoms: &[IntegerPostingAtom],
+    hw_counter: &HardwareCounterCell,
+) -> Vec<IntegerPosting> {
+    atoms
+        .iter()
+        .map(|atom| IntegerPosting {
+            query_mask: atom.query_mask,
+            point_ids: index.get_iterator(&atom.value, hw_counter).collect(),
+        })
+        .collect()
 }

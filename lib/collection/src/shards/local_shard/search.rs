@@ -49,6 +49,12 @@ impl LocalShard {
             return Ok(vec![]);
         }
 
+        // Keep the full B<=64 batch intact so candidate-major query masks and
+        // tile scheduling can see all reuse opportunities. SegmentsSearcher
+        // restores stock 16-query chunking internally if segment/storage
+        // eligibility later fails closed.
+        let candidate_major_exact =
+            SegmentsSearcher::is_candidate_major_exact_candidate(&core_request);
         let first_filter = core_request.searches[0].filter.as_ref();
         let all_filters_equal = core_request
             .searches
@@ -60,7 +66,9 @@ impl LocalShard {
             *DISTINCT_FILTER_CHUNK_SIZE
         };
 
-        let skip_batching = if core_request.searches.len() <= chunk_size {
+        let skip_batching = if candidate_major_exact {
+            true
+        } else if core_request.searches.len() <= chunk_size {
             // Don't batch if we have few searches, prevents cloning request
             true
         } else if self.segments.read().len() > self.shared_storage_config.search_thread_count {

@@ -16,6 +16,13 @@ pub(super) enum Request<'a, K: Key + ?Sized> {
     Offset(u64),
     /// Request an entry by the given key. Will resolve the offset first.
     Key(&'a K),
+    /// Request an entry by a key whose exact entry range was resolved from a
+    /// prefetched bucket-offset table.
+    KeyAtOffset {
+        requested_key: &'a K,
+        offset: u64,
+        length: u64,
+    },
 }
 
 /// State machine driver for [`UniversalHashMap::for_each_sparse`].
@@ -53,6 +60,9 @@ enum State<'a, K: Key + ?Sized> {
         byte_offset: u64,
         buf: AlignedBuf,
         expected_len: u64,
+        /// Exact maximum entry length when the caller resolved the next
+        /// persisted-hashmap offset. Unknown-length sparse reads leave it unset.
+        max_len: Option<u64>,
         requested_key: Option<&'a K>,
     },
 }
@@ -144,12 +154,35 @@ where
                     byte_offset,
                     buf,
                     expected_len,
+                    max_len,
                     requested_key: _,
                 } => {
-                    let start = byte_offset.saturating_add(buf.len() as u64);
-                    let end = byte_offset.saturating_add(*expected_len).min(self.file_len);
+                    let start = byte_offset.checked_add(buf.len() as u64).ok_or_else(|| {
+                        E::from(UniversalIoError::Io(read_err(
+                            "persisted-hashmap entry read offset overflow",
+                        )))
+                    })?;
+                    let mut end = byte_offset.checked_add(*expected_len).ok_or_else(|| {
+                        E::from(UniversalIoError::Io(read_err(
+                            "persisted-hashmap entry read length overflow",
+                        )))
+                    })?;
+                    if let Some(max_len) = max_len {
+                        let max_end = byte_offset.checked_add(*max_len).ok_or_else(|| {
+                            E::from(UniversalIoError::Io(read_err(
+                                "persisted-hashmap exact entry range overflow",
+                            )))
+                        })?;
+                        end = end.min(max_end);
+                    }
+                    let end = end.min(self.file_len);
                     if end <= start {
-                        return Err(E::from(UniversalIoError::Io(read_err("unexpected eof"))));
+                        let message = if max_len.is_some() {
+                            "persisted-hashmap entry is truncated within its exact byte range"
+                        } else {
+                            "unexpected eof"
+                        };
+                        return Err(E::from(UniversalIoError::Io(read_err(message))));
                     }
                     return Ok(Some((entry, start..end)));
                 }
@@ -160,14 +193,27 @@ where
             let (state, range);
             match request {
                 Request::Offset(offset) => {
-                    let byte_offset = self.map.entries_start + offset;
+                    let byte_offset =
+                        self.map.entries_start.checked_add(offset).ok_or_else(|| {
+                            E::from(UniversalIoError::Io(read_err(
+                                "persisted-hashmap entry offset overflow",
+                            )))
+                        })?;
                     state = State::ReadingEntry {
                         byte_offset,
                         buf: AlignedBuf::new_for_offset(byte_offset, align_of::<u128>()),
                         expected_len: self.entry_read_size_est,
+                        max_len: None,
                         requested_key: None,
                     };
-                    range = byte_offset..byte_offset + self.entry_read_size_est;
+                    let range_end = byte_offset
+                        .checked_add(self.entry_read_size_est)
+                        .ok_or_else(|| {
+                            E::from(UniversalIoError::Io(read_err(
+                                "persisted-hashmap entry read length overflow",
+                            )))
+                        })?;
+                    range = byte_offset..range_end;
                 }
                 Request::Key(requested_key) => {
                     // PHF miss: no stored entry; report immediately and continue.
@@ -177,11 +223,57 @@ where
                     };
                     // PHF hit: schedule the bucket-offset read; transitions to
                     // Loading once the offset arrives.
-                    let bucket_byte_offset =
-                        self.map.header.buckets_pos + hash * size_of::<BucketOffset>() as u64;
+                    let bucket_delta = hash
+                        .checked_mul(size_of::<BucketOffset>() as u64)
+                        .ok_or_else(|| {
+                            E::from(UniversalIoError::Io(read_err(
+                                "persisted-hashmap bucket offset overflow",
+                            )))
+                        })?;
+                    let bucket_byte_offset = self
+                        .map
+                        .header
+                        .buckets_pos
+                        .checked_add(bucket_delta)
+                        .ok_or_else(|| {
+                            E::from(UniversalIoError::Io(read_err(
+                                "persisted-hashmap bucket position overflow",
+                            )))
+                        })?;
                     state = State::ReadingOffset { requested_key };
-                    range =
-                        bucket_byte_offset..bucket_byte_offset + size_of::<BucketOffset>() as u64;
+                    let range_end = bucket_byte_offset
+                        .checked_add(size_of::<BucketOffset>() as u64)
+                        .ok_or_else(|| {
+                            E::from(UniversalIoError::Io(read_err(
+                                "persisted-hashmap bucket read overflow",
+                            )))
+                        })?;
+                    range = bucket_byte_offset..range_end;
+                }
+                Request::KeyAtOffset {
+                    requested_key,
+                    offset,
+                    length,
+                } => {
+                    let byte_offset =
+                        self.map.entries_start.checked_add(offset).ok_or_else(|| {
+                            E::from(UniversalIoError::Io(read_err(
+                                "persisted-hashmap exact entry offset overflow",
+                            )))
+                        })?;
+                    state = State::ReadingEntry {
+                        byte_offset,
+                        buf: AlignedBuf::new_for_offset(byte_offset, align_of::<u128>()),
+                        expected_len: length,
+                        max_len: Some(length),
+                        requested_key: Some(requested_key),
+                    };
+                    let range_end = byte_offset.checked_add(length).ok_or_else(|| {
+                        E::from(UniversalIoError::Io(read_err(
+                            "persisted-hashmap exact entry range overflow",
+                        )))
+                    })?;
+                    range = byte_offset..range_end;
                 }
             }
             let entry = Entry { user_data, state };
@@ -200,13 +292,23 @@ where
     {
         match entry.state {
             State::ReadingOffset { requested_key } => {
-                let byte_offset = self.map.entries_start + parse_bucket_offset(data)?;
+                let entry_offset = parse_bucket_offset(data)?;
+                let byte_offset = self
+                    .map
+                    .entries_start
+                    .checked_add(entry_offset)
+                    .ok_or_else(|| {
+                        E::from(UniversalIoError::Io(read_err(
+                            "persisted-hashmap entry offset overflow",
+                        )))
+                    })?;
                 self.queue.push(Entry {
                     user_data: entry.user_data,
                     state: State::ReadingEntry {
                         byte_offset,
                         buf: AlignedBuf::new_for_offset(byte_offset, align_of::<u128>()),
                         expected_len: self.entry_read_size_est,
+                        max_len: None,
                         requested_key: Some(requested_key),
                     },
                 });
@@ -216,6 +318,7 @@ where
                 byte_offset,
                 mut buf,
                 expected_len: _,
+                max_len,
                 mut requested_key,
             } => {
                 buf.extend_from_slice(data);
@@ -235,15 +338,24 @@ where
                 if parsed.satisfies_kind(self.entry_kind) {
                     f(entry.user_data, Some(parsed))?;
                 } else {
+                    if max_len.is_some_and(|max_len| buf.len() as u64 >= max_len) {
+                        return Err(E::from(UniversalIoError::Io(read_err(
+                            "persisted-hashmap entry is truncated within its exact byte range",
+                        ))));
+                    }
+                    let next_expected_len = (buf.len() as u64 + 1)
+                        .next_power_of_two()
+                        .max(K::KEY_SIZE_EST as u64);
                     self.queue.push(Entry {
                         user_data: entry.user_data,
                         state: State::ReadingEntry {
                             byte_offset,
                             // `+ 1` so the size strictly grows when `buf.len()` is already a
                             // power of two; otherwise the next refill reads 0 bytes and loops.
-                            expected_len: (buf.len() as u64 + 1)
-                                .next_power_of_two()
-                                .max(K::KEY_SIZE_EST as u64),
+                            expected_len: max_len.map_or(next_expected_len, |max_len| {
+                                next_expected_len.min(max_len)
+                            }),
+                            max_len,
                             buf,
                             requested_key,
                         },

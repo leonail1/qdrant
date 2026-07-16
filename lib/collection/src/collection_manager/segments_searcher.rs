@@ -12,11 +12,15 @@ use ordered_float::Float;
 use segment::common::operation_error::OperationError;
 use segment::data_types::modifier::Modifier;
 use segment::data_types::query_context::{FormulaContext, QueryContext, SegmentQueryContext};
-use segment::data_types::vectors::QueryVector;
+use segment::data_types::vectors::{Named as _, QueryVector, VectorInternal};
+use segment::entry::ReadSegmentEntry as _;
+use segment::index::factorized_exact::{
+    CandidateMajorExactConfig, CandidateMajorExactTileOutput, merge_candidate_major_exact_tiles,
+};
 use segment::index::query_optimization::factorized_filter::FactorizedFilterPlan;
 use segment::types::{
     Filter, Indexes, PointIdType, ScoredPoint, SearchParams, SegmentConfig, VectorName,
-    WithPayload, WithPayloadInterface, WithVector,
+    VectorNameBuf, WithPayload, WithPayloadInterface, WithVector,
 };
 use shard::common::stopping_guard::StoppingGuard;
 use shard::optimizers::config::DEFAULT_INDEXING_THRESHOLD_KB;
@@ -52,12 +56,135 @@ static FACTORIZED_FILTER_BATCH_ENABLED: LazyLock<bool> = LazyLock::new(|| {
         .unwrap_or(true)
 });
 
+const STOCK_QUERY_CHUNK_SIZE: usize = 16;
+
+static CANDIDATE_MAJOR_EXACT_ENABLED: LazyLock<bool> = LazyLock::new(|| {
+    std::env::var("QDRANT_COOP_CANDIDATE_MAJOR_EXACT")
+        .map(|value| !matches!(value.as_str(), "0" | "false" | "off"))
+        .unwrap_or(false)
+});
+
+static CANDIDATE_MAJOR_EXACT_BREAKDOWN: LazyLock<bool> = LazyLock::new(|| {
+    std::env::var("QDRANT_COOP_CANDIDATE_MAJOR_BREAKDOWN")
+        .map(|value| !matches!(value.as_str(), "0" | "false" | "off"))
+        .unwrap_or(false)
+});
+
+static CANDIDATE_MAJOR_EXACT_CONFIG: LazyLock<CandidateMajorExactConfig> = LazyLock::new(|| {
+    let defaults = CandidateMajorExactConfig::default();
+    CandidateMajorExactConfig {
+        max_tiles: candidate_major_env_usize(
+            "QDRANT_COOP_CANDIDATE_MAJOR_MAX_TILES",
+            defaults.max_tiles,
+        ),
+        min_score_pairs_per_tile: candidate_major_env_usize(
+            "QDRANT_COOP_CANDIDATE_MAJOR_MIN_SCORE_PAIRS_PER_TILE",
+            defaults.min_score_pairs_per_tile,
+        ),
+        ordinal_ordering_threshold: candidate_major_env_usize(
+            "QDRANT_COOP_CANDIDATE_MAJOR_ORDINAL_THRESHOLD",
+            defaults.ordinal_ordering_threshold,
+        ),
+    }
+});
+
+fn candidate_major_env_usize(name: &str, default: usize) -> usize {
+    std::env::var(name)
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .filter(|&value| value > 0)
+        .unwrap_or(default)
+}
+
+#[derive(Clone)]
+struct CandidateMajorExactBatch {
+    vector_name: VectorNameBuf,
+    queries: Vec<QueryVector>,
+    factorized_plan: FactorizedFilterPlan,
+    with_payload: WithPayload,
+    with_vector: WithVector,
+    top: usize,
+}
+
+fn candidate_major_exact_batch_shape(
+    batch_request: &CoreSearchRequestBatch,
+) -> Option<CandidateMajorExactBatch> {
+    if !*CANDIDATE_MAJOR_EXACT_ENABLED
+        || !(2..=u64::BITS as usize).contains(&batch_request.searches.len())
+    {
+        return None;
+    }
+
+    let first = batch_request.searches.first()?;
+    let first_named = match &first.query {
+        QueryEnum::Nearest(named) if matches!(&named.query, VectorInternal::Dense(_)) => named,
+        _ => return None,
+    };
+    if first.params.is_some_and(|params| params.indexed_only) {
+        return None;
+    }
+    let vector_name = first_named.get_name().to_owned();
+    let with_payload_interface = first
+        .with_payload
+        .as_ref()
+        .unwrap_or(&WithPayloadInterface::Bool(false));
+    let with_payload = WithPayload::from(with_payload_interface);
+    let with_vector = first.with_vector.clone().unwrap_or_default();
+    let top = first.limit.checked_add(first.offset)?;
+
+    let mut queries = Vec::with_capacity(batch_request.searches.len());
+    let mut filters = Vec::with_capacity(batch_request.searches.len());
+    for request in &batch_request.searches {
+        let QueryEnum::Nearest(named) = &request.query else {
+            return None;
+        };
+        let VectorInternal::Dense(vector) = &named.query else {
+            return None;
+        };
+        if named.get_name() != vector_name.as_str()
+            || request.params != first.params
+            || request.limit.checked_add(request.offset)? != top
+            || WithPayload::from(
+                request
+                    .with_payload
+                    .as_ref()
+                    .unwrap_or(&WithPayloadInterface::Bool(false)),
+            ) != with_payload
+            || request.with_vector.clone().unwrap_or_default() != with_vector
+        {
+            return None;
+        }
+        queries.push(QueryVector::Nearest(VectorInternal::Dense(vector.clone())));
+        filters.push(request.filter.as_ref()?);
+    }
+
+    let factorized_plan = FactorizedFilterPlan::try_from_filter_refs(&filters).ok()?;
+    if factorized_plan.atom_reference_count() <= factorized_plan.atoms().len() {
+        return None;
+    }
+
+    Some(CandidateMajorExactBatch {
+        vector_name,
+        queries,
+        factorized_plan,
+        with_payload,
+        with_vector,
+        top,
+    })
+}
+
 /// Simple implementation of segment manager
 ///  - rebuild segment for memory optimization purposes
 #[derive(Default)]
 pub struct SegmentsSearcher;
 
 impl SegmentsSearcher {
+    pub(crate) fn is_candidate_major_exact_candidate(
+        batch_request: &CoreSearchRequestBatch,
+    ) -> bool {
+        candidate_major_exact_batch_shape(batch_request).is_some()
+    }
+
     /// Execute searches in parallel and return results in the same order as the searches were provided
     async fn execute_searches(
         searches: Vec<AbortOnDropHandle<SegmentSearchExecutedResult>>,
@@ -223,8 +350,73 @@ impl SegmentsSearcher {
         query_context: QueryContext,
         timeout: Duration,
     ) -> CollectionResult<Vec<Vec<ScoredPoint>>> {
+        let query_context = Arc::new(query_context);
+        let candidate_batch = candidate_major_exact_batch_shape(&batch_request);
+        if let Some(candidate_batch) = candidate_batch.as_ref() {
+            if let Some(result) = Self::try_candidate_major_exact_search(
+                segments.clone(),
+                batch_request.clone(),
+                candidate_batch.clone(),
+                runtime_handle,
+                query_context.clone(),
+                timeout,
+            )
+            .await?
+            {
+                return Ok(result);
+            }
+            log::debug!(
+                "candidate-major exact batch failed segment/storage eligibility; using stock search"
+            );
+        }
+
+        // LocalShard deliberately keeps a candidate batch intact so all B<=64
+        // query masks reach the cooperative executor. If the segment layout or
+        // storage fails closed, restore stock query-level parallelism here.
+        if candidate_batch.is_some() && batch_request.searches.len() > STOCK_QUERY_CHUNK_SIZE {
+            let chunk_searches = batch_request
+                .searches
+                .chunks(STOCK_QUERY_CHUNK_SIZE)
+                .map(|chunk| {
+                    Self::search_stock(
+                        segments.clone(),
+                        Arc::new(CoreSearchRequestBatch {
+                            searches: chunk.to_vec(),
+                        }),
+                        runtime_handle,
+                        sampling_enabled,
+                        query_context.clone(),
+                        timeout,
+                    )
+                })
+                .collect::<Vec<_>>();
+            return Ok(futures::future::try_join_all(chunk_searches)
+                .await?
+                .into_iter()
+                .flatten()
+                .collect());
+        }
+
+        Self::search_stock(
+            segments,
+            batch_request,
+            runtime_handle,
+            sampling_enabled,
+            query_context,
+            timeout,
+        )
+        .await
+    }
+
+    async fn search_stock(
+        segments: LockedSegmentHolder,
+        batch_request: Arc<CoreSearchRequestBatch>,
+        runtime_handle: &AdaptiveSearchHandle,
+        sampling_enabled: bool,
+        query_context_arc: Arc<QueryContext>,
+        timeout: Duration,
+    ) -> CollectionResult<Vec<Vec<ScoredPoint>>> {
         let start = Instant::now();
-        let query_context_arc = Arc::new(query_context);
 
         // Using block to ensure `segments` variable is dropped in the end of it
         let (locked_segments, searches): (Vec<_>, Vec<_>) = {
@@ -380,6 +572,260 @@ impl SegmentsSearcher {
 
         let top_scores: Vec<_> = result_aggregator.into_topk();
         Ok(top_scores)
+    }
+
+    async fn try_candidate_major_exact_search(
+        segments: LockedSegmentHolder,
+        batch_request: Arc<CoreSearchRequestBatch>,
+        candidate_batch: CandidateMajorExactBatch,
+        runtime_handle: &AdaptiveSearchHandle,
+        query_context: Arc<QueryContext>,
+        timeout: Duration,
+    ) -> CollectionResult<Option<Vec<Vec<ScoredPoint>>>> {
+        let total_started = Instant::now();
+        let segment_list = {
+            let Some(segments_lock) = segments.try_read_for(timeout) else {
+                return Err(CollectionError::timeout(
+                    timeout,
+                    "candidate-major segment layout",
+                ));
+            };
+            segments_lock
+                .non_appendable_then_appendable_segments()
+                .collect::<Vec<_>>()
+        };
+
+        let mut main_segment = None;
+        let mut stock_segments = Vec::new();
+        for segment in segment_list {
+            let LockedSegment::Original(original) = segment else {
+                // Proxy segments may redirect writes and expose deleted-point
+                // overlays. Keep their complete stock execution semantics.
+                return Ok(None);
+            };
+
+            let lock_timeout = timeout.saturating_sub(total_started.elapsed());
+            let Some(read_segment) = original.try_read_for(lock_timeout) else {
+                return Err(CollectionError::timeout(
+                    timeout,
+                    "candidate-major segment layout",
+                ));
+            };
+            let use_as_main = main_segment.is_none()
+                && !read_segment.is_appendable()
+                && read_segment.available_point_count_without_deferred() > 0;
+            drop(read_segment);
+
+            if use_as_main {
+                main_segment = Some(original);
+            } else {
+                stock_segments.push(LockedSegment::Original(original));
+            }
+        }
+        let Some(main_segment) = main_segment else {
+            return Ok(None);
+        };
+
+        let prepare_started = Instant::now();
+        let prepare_timeout = timeout.saturating_sub(total_started.elapsed());
+        let prepare_segment = main_segment.clone();
+        let prepare_batch = candidate_batch.clone();
+        let prepare_context = query_context.clone();
+        let prepare_cpu = prepare_context
+            .hardware_usage_accumulator()
+            .cpu_utilization();
+        let prepare_handle = runtime_handle.spawn_blocking(move || {
+            prepare_cpu.measure(|| -> CollectionResult<_> {
+                let Some(read_segment) = prepare_segment.try_read_for(prepare_timeout) else {
+                    return Err(CollectionError::timeout(
+                        prepare_timeout,
+                        "candidate-major prepare",
+                    ));
+                };
+                let segment_version = read_segment.version();
+                let segment_query_context = prepare_context.get_segment_query_context();
+                let query_refs = prepare_batch.queries.iter().collect_vec();
+                let plan = read_segment.prepare_candidate_major_exact(
+                    &prepare_batch.vector_name,
+                    &query_refs,
+                    &prepare_batch.factorized_plan,
+                    prepare_batch.top,
+                    *CANDIDATE_MAJOR_EXACT_CONFIG,
+                    &segment_query_context,
+                )?;
+                Ok(plan.map(|plan| (segment_version, Arc::new(plan))))
+            })
+        });
+        let Some((segment_version, plan)) = AbortOnDropHandle::new(prepare_handle).await?? else {
+            return Ok(None);
+        };
+        let prepare_elapsed = prepare_started.elapsed();
+
+        // Start stock work for appendable and secondary original segments
+        // before scoring tiles. These tasks participate in the same final
+        // version-aware BatchResultAggregator.
+        let stock_searches = stock_segments
+            .into_iter()
+            .map(|segment| {
+                let request = batch_request.clone();
+                let stock_context = query_context.clone();
+                let stock_timeout = timeout.saturating_sub(total_started.elapsed());
+                let stock_cpu = stock_context.hardware_usage_accumulator().cpu_utilization();
+                let handle = runtime_handle.spawn_blocking(move || {
+                    stock_cpu.measure(|| {
+                        let segment_query_context = stock_context.get_segment_query_context();
+                        search_in_segment(
+                            segment,
+                            request,
+                            false,
+                            &segment_query_context,
+                            stock_timeout,
+                        )
+                    })
+                });
+                AbortOnDropHandle::new(handle)
+            })
+            .collect::<Vec<_>>();
+        let stock_segment_count = stock_searches.len();
+
+        let score_started = Instant::now();
+        let mut tile_searches = FuturesUnordered::new();
+        for tile_ordinal in 0..plan.tile_count() {
+            let tile_segment = main_segment.clone();
+            let tile_plan = plan.clone();
+            let tile_context = query_context.clone();
+            let tile_vector_name = candidate_batch.vector_name.clone();
+            let tile_timeout = timeout.saturating_sub(total_started.elapsed());
+            let tile_cpu = tile_context.hardware_usage_accumulator().cpu_utilization();
+            let handle = runtime_handle.spawn_blocking(move || {
+                tile_cpu.measure(|| -> CollectionResult<_> {
+                    let Some(read_segment) = tile_segment.try_read_for(tile_timeout) else {
+                        return Err(CollectionError::timeout(
+                            tile_timeout,
+                            "candidate-major tile",
+                        ));
+                    };
+                    if read_segment.version() != segment_version {
+                        return Ok(None);
+                    }
+                    let segment_query_context = tile_context.get_segment_query_context();
+                    read_segment
+                        .score_candidate_major_exact_tile(
+                            &tile_vector_name,
+                            &tile_plan,
+                            tile_ordinal,
+                            &segment_query_context,
+                        )
+                        .map_err(Into::into)
+                })
+            });
+            tile_searches.push(AbortOnDropHandle::new(handle));
+        }
+
+        let mut tile_outputs =
+            Vec::<CandidateMajorExactTileOutput>::with_capacity(plan.tile_count());
+        while let Some(tile_result) = tile_searches.try_next().await? {
+            let Some(tile_output) = tile_result? else {
+                return Ok(None);
+            };
+            tile_outputs.push(tile_output);
+        }
+        let score_elapsed = score_started.elapsed();
+
+        let merge_started = Instant::now();
+        let merge_plan = plan.clone();
+        let merge_cpu = query_context.hardware_usage_accumulator().cpu_utilization();
+        let merge_handle = runtime_handle.spawn_blocking(move || {
+            merge_cpu.measure(|| merge_candidate_major_exact_tiles(&merge_plan, tile_outputs))
+        });
+        let merged = AbortOnDropHandle::new(merge_handle).await??;
+        let merge_elapsed = merge_started.elapsed();
+        let stats = merged.stats;
+
+        let materialize_started = Instant::now();
+        let materialize_segment = main_segment;
+        let materialize_context = query_context.clone();
+        let materialize_batch = candidate_batch;
+        let materialize_timeout = timeout.saturating_sub(total_started.elapsed());
+        let materialize_cpu = materialize_context
+            .hardware_usage_accumulator()
+            .cpu_utilization();
+        let materialize_handle = runtime_handle.spawn_blocking(move || {
+            materialize_cpu.measure(|| -> CollectionResult<_> {
+                let Some(read_segment) = materialize_segment.try_read_for(materialize_timeout)
+                else {
+                    return Err(CollectionError::timeout(
+                        materialize_timeout,
+                        "candidate-major materialize",
+                    ));
+                };
+                if read_segment.version() != segment_version {
+                    return Ok(None);
+                }
+                let segment_query_context = materialize_context.get_segment_query_context();
+                read_segment
+                    .materialize_candidate_major_exact(
+                        &materialize_batch.vector_name,
+                        merged.results,
+                        &materialize_batch.with_payload,
+                        &materialize_batch.with_vector,
+                        &segment_query_context,
+                    )
+                    .map(Some)
+                    .map_err(Into::into)
+            })
+        });
+        let Some(main_results) = AbortOnDropHandle::new(materialize_handle).await?? else {
+            return Ok(None);
+        };
+        let materialize_elapsed = materialize_started.elapsed();
+
+        let (stock_results, _) = Self::execute_searches(stock_searches).await?;
+        let mut all_results = Vec::with_capacity(1 + stock_results.len());
+        all_results.push(main_results);
+        all_results.extend(stock_results);
+
+        let limits = batch_request
+            .searches
+            .iter()
+            .map(|request| request.limit + request.offset)
+            .collect::<Vec<_>>();
+        let mut result_aggregator = BatchResultAggregator::new(limits);
+        result_aggregator.update_point_versions(all_results.iter().flatten().flatten());
+        for segment_result in all_results {
+            for (batch_index, query_result) in segment_result.into_iter().enumerate() {
+                result_aggregator.update_batch_results(batch_index, query_result);
+            }
+        }
+
+        if *CANDIDATE_MAJOR_EXACT_BREAKDOWN {
+            let prepare_stats = plan.prepare_stats();
+            log::info!(
+                "candidate_major_exact_breakdown queries={} posting_atoms={} posting_points={} single_valued={} input_candidates={} vector_reads={} score_pairs={} tiles={} ordinal_ordered={} ordinal_sort_applied={} stock_segments={} atom_build_us={} posting_fetch_us={} candidate_collect_us={} plan_build_us={} prepare_us={} score_wall_us={} merge_us={} materialize_us={} total_us={}",
+                batch_request.searches.len(),
+                prepare_stats.posting_atoms,
+                prepare_stats.posting_points,
+                prepare_stats.single_valued,
+                stats.input_candidates,
+                stats.vector_reads,
+                stats.scored_pairs,
+                stats.tiles,
+                stats.ordinal_ordered,
+                stats.ordinal_sort_applied,
+                stock_segment_count,
+                prepare_stats.atom_build_us,
+                prepare_stats.posting_fetch_us,
+                prepare_stats.candidate_collect_us,
+                prepare_stats.plan_build_us,
+                prepare_elapsed.as_micros(),
+                score_elapsed.as_micros(),
+                merge_elapsed.as_micros(),
+                materialize_elapsed.as_micros(),
+                total_started.elapsed().as_micros(),
+            );
+        }
+
+        Ok(Some(result_aggregator.into_topk()))
     }
 
     /// Retrieve records for the given points ids from the segments

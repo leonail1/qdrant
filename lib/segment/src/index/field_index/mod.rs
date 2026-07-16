@@ -3,7 +3,7 @@ use std::ops::Deref;
 use ahash::AHashSet;
 use common::types::PointOffsetType;
 
-use crate::types::{Condition, FieldCondition, PointIdType, VectorNameBuf};
+use crate::types::{Condition, FieldCondition, IntPayloadType, PointIdType, VectorNameBuf};
 
 pub mod bool_index;
 pub(super) mod facet_index;
@@ -30,6 +30,42 @@ pub use facet_index::FacetIndex;
 pub use field_index_base::*;
 
 use crate::utils::maybe_arc::MaybeArc;
+
+/// One integer equality atom in a batched payload-posting lookup.
+///
+/// `query_mask` is opaque to the payload index. Carrying it through the
+/// batched API lets candidate-major callers associate a posting with its
+/// queries without rebuilding an atom-to-mask map after storage IO.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct IntegerPostingAtom {
+    pub value: IntPayloadType,
+    pub query_mask: u64,
+}
+
+impl IntegerPostingAtom {
+    pub const fn new(value: IntPayloadType, query_mask: u64) -> Self {
+        Self { value, query_mask }
+    }
+}
+
+/// One posting returned by [`IntegerPostingBatch`].
+///
+/// Batches preserve the input atom order even when the storage backend
+/// completes reads in a different order.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct IntegerPosting {
+    pub query_mask: u64,
+    pub point_ids: Vec<PointOffsetType>,
+}
+
+/// Fail-closed result of a narrow batched integer map-index lookup.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct IntegerPostingBatch {
+    pub postings: Vec<IntegerPosting>,
+    /// True only when index counters prove that every indexed point has
+    /// exactly one value. In that case postings are mutually exclusive.
+    pub single_valued: bool,
+}
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct ResolvedHasId {

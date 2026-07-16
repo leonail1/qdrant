@@ -6,13 +6,16 @@ use crate::common::operation_error::OperationResult;
 use crate::id_tracker::IdTrackerRead;
 use crate::index::PayloadIndexRead;
 use crate::index::field_index::{
-    CardinalityEstimation, FieldIndexRead, PrimaryCondition, ResolvedHasId,
+    CardinalityEstimation, FieldIndexRead, IntegerPostingAtom, IntegerPostingBatch,
+    PrimaryCondition, ResolvedHasId,
 };
 use crate::index::query_optimization::payload_provider::PayloadProvider;
 use crate::index::struct_filter_context::StructFilterContext;
 use crate::json_path::JsonPath;
 use crate::payload_storage::PayloadStorageRead;
-use crate::types::{Condition, FieldCondition, Filter, IsEmptyCondition, IsNullCondition};
+use crate::types::{
+    Condition, FieldCondition, Filter, IsEmptyCondition, IsNullCondition, PayloadKeyType,
+};
 use crate::vector_storage::VectorStorageRead;
 
 impl<'a, P, I, V, F> StructPayloadIndexReadView<'a, P, I, V, F>
@@ -89,6 +92,28 @@ where
             .iter()
             .find_map(|field_index| field_index.filter(field_condition, hw_counter).transpose())
             .transpose()
+    }
+
+    /// Fetch integer equality postings through one compatible map index.
+    ///
+    /// Returns `None` unless the field has an integer map index. Other index
+    /// kinds are deliberately ignored so callers can use the stock condition
+    /// path without weakening filter semantics.
+    pub(crate) fn query_integer_postings_batch(
+        &self,
+        key: &PayloadKeyType,
+        atoms: &[IntegerPostingAtom],
+        hw_counter: &HardwareCounterCell,
+    ) -> OperationResult<Option<IntegerPostingBatch>> {
+        let Some(field_indexes) = self.field_indexes.get(key) else {
+            return Ok(None);
+        };
+        for field_index in field_indexes {
+            if let Some(batch) = field_index.batched_integer_postings(atoms, hw_counter)? {
+                return Ok(Some(batch));
+            }
+        }
+        Ok(None)
     }
 
     pub fn struct_filtered_context<'q>(

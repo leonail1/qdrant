@@ -4,6 +4,7 @@ use common::types::PointOffsetType;
 use super::payload_field_index::PayloadFieldIndexRead;
 use crate::index::field_index::facet_index::FacetIndex;
 use crate::index::field_index::numeric_index::NumericFieldIndexRead;
+use crate::index::field_index::{IntegerPostingAtom, IntegerPostingBatch};
 use crate::index::query_optimization::rescore_formula::value_retriever::VariableRetrieverFn;
 use crate::telemetry::PayloadIndexTelemetry;
 
@@ -29,6 +30,19 @@ use crate::telemetry::PayloadIndexTelemetry;
 ///
 /// [`StructPayloadIndexReadView`]: crate::index::struct_payload_index::StructPayloadIndexReadView
 pub trait FieldIndexRead: PayloadFieldIndexRead {
+    /// Fetch integer equality postings as one storage request.
+    ///
+    /// The default is deliberately unsupported. Only an integer map index may
+    /// return `Some`, so callers can safely fall back when a field is backed
+    /// by a different index type.
+    fn batched_integer_postings(
+        &self,
+        _atoms: &[IntegerPostingAtom],
+        _hw_counter: &HardwareCounterCell,
+    ) -> crate::common::operation_error::OperationResult<Option<IntegerPostingBatch>> {
+        Ok(None)
+    }
+
     /// Per-index telemetry snapshot.
     fn get_telemetry_data(&self) -> PayloadIndexTelemetry;
 

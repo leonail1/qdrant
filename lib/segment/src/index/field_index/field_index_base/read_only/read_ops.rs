@@ -15,7 +15,8 @@ use crate::index::field_index::numeric_index::{
     NumericFieldIndexRead, NumericIndexRead, ReadOnlyNumericFieldIndex,
 };
 use crate::index::field_index::{
-    CardinalityEstimation, FacetIndex, FieldIndexRead, PayloadBlockCondition, PayloadFieldIndexRead,
+    CardinalityEstimation, FacetIndex, FieldIndexRead, IntegerPostingAtom, IntegerPostingBatch,
+    PayloadBlockCondition, PayloadFieldIndexRead,
 };
 use crate::index::query_optimization::optimized_filter::ConditionCheckerFn;
 use crate::index::query_optimization::rescore_formula::value_retriever::VariableRetrieverFn;
@@ -173,6 +174,28 @@ impl<S: UniversalRead> PayloadFieldIndexRead for ReadOnlyFieldIndex<S> {
 }
 
 impl<S: UniversalRead> FieldIndexRead for ReadOnlyFieldIndex<S> {
+    fn batched_integer_postings(
+        &self,
+        atoms: &[IntegerPostingAtom],
+        hw_counter: &HardwareCounterCell,
+    ) -> OperationResult<Option<IntegerPostingBatch>> {
+        match self {
+            ReadOnlyFieldIndex::IntMapIndex(index) => {
+                index.batched_integer_postings(atoms, hw_counter).map(Some)
+            }
+            ReadOnlyFieldIndex::IntIndex(_)
+            | ReadOnlyFieldIndex::DatetimeIndex(_)
+            | ReadOnlyFieldIndex::KeywordIndex(_)
+            | ReadOnlyFieldIndex::FloatIndex(_)
+            | ReadOnlyFieldIndex::GeoIndex(_)
+            | ReadOnlyFieldIndex::FullTextIndex(_)
+            | ReadOnlyFieldIndex::BoolIndex(_)
+            | ReadOnlyFieldIndex::UuidIndex(_)
+            | ReadOnlyFieldIndex::UuidMapIndex(_)
+            | ReadOnlyFieldIndex::NullIndex(_) => Ok(None),
+        }
+    }
+
     fn get_telemetry_data(&self) -> PayloadIndexTelemetry {
         match self {
             ReadOnlyFieldIndex::IntIndex(idx) => idx.get_telemetry_data(),

@@ -1,4 +1,5 @@
 mod entry;
+mod factorized_exact;
 pub mod memory;
 mod search;
 mod segment_ops;

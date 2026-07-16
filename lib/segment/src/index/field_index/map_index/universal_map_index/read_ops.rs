@@ -15,7 +15,11 @@ use super::super::{IdIter, MapIndexKey};
 use super::UniversalMapIndex;
 use crate::common::operation_error::OperationResult;
 use crate::index::field_index::stored_point_to_values::ValuesIter;
+use crate::index::field_index::{IntegerPosting, IntegerPostingAtom, IntegerPostingBatch};
 use crate::index::payload_config::StorageType;
+
+const PREFETCHED_OFFSETS_MIN_ATOMS: usize = 64;
+const PREFETCHED_OFFSETS_MAX_TABLE_BYTES: usize = 256 * 1024;
 
 impl<N: MapIndexKey + Key + ?Sized, S: UniversalRead> MapIndexRead<N> for UniversalMapIndex<N, S> {
     fn check_values_any(
@@ -254,5 +258,101 @@ impl<N: MapIndexKey + Key + ?Sized, S: UniversalRead> UniversalMapIndex<N, S> {
 
     pub fn is_on_disk(&self) -> bool {
         self.is_on_disk
+    }
+}
+
+impl<S: UniversalRead> UniversalMapIndex<crate::types::IntPayloadType, S> {
+    /// Read all requested integer postings through one persisted-hashmap
+    /// pipeline. Pipeline callbacks may arrive out of input order, so each
+    /// result is written back by atom ordinal and exposed in original order.
+    pub(in crate::index::field_index::map_index) fn batched_integer_postings(
+        &self,
+        atoms: &[IntegerPostingAtom],
+        hw_counter: &HardwareCounterCell,
+        single_valued: bool,
+    ) -> OperationResult<IntegerPostingBatch> {
+        let hw_counter = self.make_conditioned_counter(hw_counter);
+        let deleted = &self.storage.deleted;
+        let mut point_ids = vec![Vec::new(); atoms.len()];
+
+        let requests = || {
+            atoms
+                .iter()
+                .enumerate()
+                .map(|(atom_ordinal, atom)| (atom_ordinal, &atom.value))
+        };
+        let mut collect_posting = |atom_ordinal: usize, values: Option<&[PointOffsetType]>| {
+            hw_counter
+                .payload_index_io_read_counter()
+                .incr_delta(READ_ENTRY_OVERHEAD + values.map_or(0, size_of_val));
+
+            if let Some(values) = values {
+                point_ids[atom_ordinal].reserve(values.len());
+                point_ids[atom_ordinal].extend(
+                    values
+                        .iter()
+                        .copied()
+                        .filter(|point_id| !deleted.get_bit(*point_id as usize).unwrap_or(false)),
+                );
+            }
+            Ok::<(), crate::common::operation_error::OperationError>(())
+        };
+
+        let bucket_table_bytes = self
+            .storage
+            .value_to_points
+            .keys_count()
+            .saturating_mul(size_of::<u64>());
+        if should_prefetch_offsets(atoms.len(), bucket_table_bytes) {
+            hw_counter
+                .payload_index_io_read_counter()
+                .incr_delta(bucket_table_bytes);
+            self.storage
+                .value_to_points
+                .for_each_entry_in_iter_prefetched_offsets(requests(), &mut collect_posting)?;
+        } else {
+            self.storage
+                .value_to_points
+                .for_each_entry_in_iter(requests(), &mut collect_posting)?;
+        }
+
+        let postings = atoms
+            .iter()
+            .zip(point_ids)
+            .map(|(atom, point_ids)| IntegerPosting {
+                query_mask: atom.query_mask,
+                point_ids,
+            })
+            .collect();
+        Ok(IntegerPostingBatch {
+            postings,
+            single_valued,
+        })
+    }
+}
+
+fn should_prefetch_offsets(atom_count: usize, bucket_table_bytes: usize) -> bool {
+    atom_count >= PREFETCHED_OFFSETS_MIN_ATOMS
+        && bucket_table_bytes <= PREFETCHED_OFFSETS_MAX_TABLE_BYTES
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{PREFETCHED_OFFSETS_MAX_TABLE_BYTES, should_prefetch_offsets};
+
+    #[test]
+    fn prefetched_offset_gate_covers_atom_and_table_boundaries() {
+        assert!(!should_prefetch_offsets(
+            63,
+            PREFETCHED_OFFSETS_MAX_TABLE_BYTES
+        ));
+        assert!(should_prefetch_offsets(
+            64,
+            PREFETCHED_OFFSETS_MAX_TABLE_BYTES
+        ));
+        assert!(!should_prefetch_offsets(
+            64,
+            PREFETCHED_OFFSETS_MAX_TABLE_BYTES + 1
+        ));
     }
 }

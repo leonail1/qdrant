@@ -82,12 +82,29 @@ where
         })?;
         let phf = Function::read(&mut Cursor::new(&*phf_bytes))?;
 
-        let entries_start =
-            header.buckets_pos + header.buckets_count * size_of::<BucketOffset>() as u64;
+        let bucket_table_len = header
+            .buckets_count
+            .checked_mul(size_of::<BucketOffset>() as u64)
+            .ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "bucket-offset table length overflow",
+                )
+            })?;
+        let entries_start = header
+            .buckets_pos
+            .checked_add(bucket_table_len)
+            .ok_or_else(|| {
+                io::Error::new(io::ErrorKind::InvalidData, "entry data offset overflow")
+            })?;
 
-        let average_entry_size = (storage.len()? - entries_start)
-            .checked_div(header.buckets_count)
-            .unwrap_or(0);
+        let entries_len = storage.len()?.checked_sub(entries_start).ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "entry data offset is outside the persisted-hashmap file",
+            )
+        })?;
+        let average_entry_size = entries_len.checked_div(header.buckets_count).unwrap_or(0);
 
         Ok(UniversalHashMap {
             storage,
@@ -213,6 +230,133 @@ where
             MaybeIncompleteEntryKind::KeyAndValues,
             keys.into_iter()
                 .map(|(user_data, key)| (user_data, Request::Key(key))),
+            |user_data, entry| {
+                let values =
+                    entry.map(|e| e.values().expect("KeyAndValues entry should have values"));
+                f(user_data, values)
+            },
+        )
+    }
+
+    /// Read entries for a larger key batch after prefetching the complete
+    /// bucket-offset table.
+    ///
+    /// The normal sparse pipeline first reads one bucket offset and then grows
+    /// an entry buffer until its value array is complete. For hundreds of
+    /// medium-sized postings that can require several random reads per key.
+    /// Prefetching the compact offset table lets us derive each entry's exact
+    /// byte range and fetch it in one pipelined read.
+    pub fn for_each_entry_in_iter_prefetched_offsets<U, I, F, E>(
+        &self,
+        keys: I,
+        mut f: F,
+    ) -> Result<(), E>
+    where
+        U: UserData,
+        I: IntoIterator<Item = (U, &'key K)>,
+        F: FnMut(U, Option<&[V]>) -> Result<(), E>,
+        E: From<UniversalIoError>,
+    {
+        let keys = keys.into_iter();
+        if self.header.buckets_count == 0 {
+            for (user_data, _) in keys {
+                f(user_data, None)?;
+            }
+            return Ok(());
+        }
+
+        let bucket_table_len = self
+            .header
+            .buckets_count
+            .checked_mul(size_of::<BucketOffset>() as u64)
+            .ok_or_else(|| {
+                E::from(UniversalIoError::Io(read_err(
+                    "persisted-hashmap bucket-offset table length overflow",
+                )))
+            })?;
+        let buckets = self.storage.read::<Sequential>(ReadRange {
+            byte_offset: self.header.buckets_pos,
+            length: bucket_table_len,
+        })?;
+        let mut bucket_offsets = Vec::with_capacity(self.header.buckets_count as usize);
+        for chunk in buckets.chunks_exact(size_of::<BucketOffset>()) {
+            bucket_offsets.push(parse_bucket_offset(chunk).map_err(E::from)?);
+        }
+        if bucket_offsets.len() != self.header.buckets_count as usize {
+            return Err(E::from(UniversalIoError::Io(read_err(
+                "truncated bucket-offset table",
+            ))));
+        }
+
+        let mut ordered_offsets = bucket_offsets.clone();
+        ordered_offsets.sort_unstable();
+        if ordered_offsets.windows(2).any(|pair| pair[0] == pair[1]) {
+            return Err(E::from(UniversalIoError::Io(read_err(
+                "duplicate persisted-hashmap entry offsets",
+            ))));
+        }
+
+        let entries_len = self
+            .storage
+            .len()?
+            .checked_sub(self.entries_start)
+            .ok_or_else(|| {
+                E::from(UniversalIoError::Io(read_err(
+                    "persisted-hashmap entry data offset is outside the file",
+                )))
+            })?;
+        if ordered_offsets
+            .last()
+            .is_some_and(|&offset| offset >= entries_len)
+        {
+            return Err(E::from(UniversalIoError::Io(read_err(
+                "persisted-hashmap entry offset is outside the data region",
+            ))));
+        }
+
+        let mut requests = Vec::new();
+        for (user_data, key) in keys {
+            let Some(hash) = self.phf.get(key) else {
+                f(user_data, None)?;
+                continue;
+            };
+            let Some(&offset) = bucket_offsets.get(hash as usize) else {
+                return Err(E::from(UniversalIoError::Io(read_err(
+                    "persisted-hashmap bucket hash is outside the offset table",
+                ))));
+            };
+            let offset_ordinal = ordered_offsets.binary_search(&offset).map_err(|_| {
+                E::from(UniversalIoError::Io(read_err(
+                    "persisted-hashmap entry offset is missing from the offset table",
+                )))
+            })?;
+            let next_offset = ordered_offsets
+                .get(offset_ordinal + 1)
+                .copied()
+                .unwrap_or(entries_len);
+            let Some(length) = next_offset.checked_sub(offset) else {
+                return Err(E::from(UniversalIoError::Io(read_err(
+                    "persisted-hashmap entry offsets are not monotonic",
+                ))));
+            };
+            if length == 0 {
+                return Err(E::from(UniversalIoError::Io(read_err(
+                    "persisted-hashmap entry has an empty byte range",
+                ))));
+            }
+            requests.push((
+                user_data,
+                Request::KeyAtOffset {
+                    requested_key: key,
+                    offset,
+                    length,
+                },
+            ));
+        }
+
+        self.for_each_sparse(
+            MaybeIncompleteEntryKind::KeyAndValues,
+            requests.into_iter(),
             |user_data, entry| {
                 let values =
                     entry.map(|e| e.values().expect("KeyAndValues entry should have values"));

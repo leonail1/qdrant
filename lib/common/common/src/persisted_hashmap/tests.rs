@@ -236,6 +236,58 @@ fn run_uio_checks<K: ?Sized + TestKey, V: TestValue, S: UniversalRead>(
         collected.sort();
         assert_equal(collected.iter(), shuffled.iter());
     });
+
+    r.check("for_each_entry_in_iter_prefetched_offsets", || {
+        #[derive(Debug, Eq, PartialEq, Ord, PartialOrd)]
+        struct Entry<KO, V> {
+            key: KO,
+            values: Option<Vec<V>>,
+            user_data: u16,
+        }
+
+        let mut rng2 = rng.fork();
+        let mut shuffled = std::iter::chain(
+            orig.iter().map(|(k, v)| Entry {
+                key: k.clone(),
+                values: Some(v.clone()),
+                user_data: rng.random::<u16>(),
+            }),
+            non_existing_keys.iter().map(|k| Entry {
+                key: k.clone(),
+                values: None,
+                user_data: rng2.random::<u16>(),
+            }),
+        )
+        .collect_vec();
+        shuffled.shuffle(&mut rng);
+
+        let mut collected = Vec::new();
+        uio.for_each_entry_in_iter_prefetched_offsets(
+            shuffled.iter().map(|entry| {
+                let Entry {
+                    key,
+                    values: _,
+                    user_data,
+                } = entry;
+                ((*user_data, key.clone()), K::as_ref(key))
+            }),
+            |(user_data, key), vals| {
+                push_val(
+                    &mut collected,
+                    Entry {
+                        key,
+                        values: vals.map(|v| v.to_vec()),
+                        user_data,
+                    },
+                )
+            },
+        )
+        .unwrap();
+
+        shuffled.sort();
+        collected.sort();
+        assert_equal(collected.iter(), shuffled.iter());
+    });
 }
 
 #[expect(clippy::unnecessary_wraps, reason = "reduce boilerplate in checks")]

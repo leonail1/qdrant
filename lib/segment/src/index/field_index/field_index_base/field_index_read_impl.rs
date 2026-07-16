@@ -14,6 +14,7 @@ use crate::index::field_index::geo_index::GeoMapIndexRead;
 use crate::index::field_index::null_index::NullIndexRead;
 use crate::index::field_index::numeric_index::{NumericFieldIndex, NumericFieldIndexRead};
 use crate::index::field_index::{CardinalityEstimation, PayloadBlockCondition};
+use crate::index::field_index::{IntegerPostingAtom, IntegerPostingBatch};
 use crate::index::query_optimization::optimized_filter::ConditionCheckerFn;
 use crate::index::query_optimization::rescore_formula::value_retriever::VariableRetrieverFn;
 use crate::telemetry::PayloadIndexTelemetry;
@@ -162,6 +163,28 @@ impl PayloadFieldIndexRead for FieldIndex {
 }
 
 impl FieldIndexRead for FieldIndex {
+    fn batched_integer_postings(
+        &self,
+        atoms: &[IntegerPostingAtom],
+        hw_counter: &HardwareCounterCell,
+    ) -> OperationResult<Option<IntegerPostingBatch>> {
+        match self {
+            FieldIndex::IntMapIndex(index) => {
+                index.batched_integer_postings(atoms, hw_counter).map(Some)
+            }
+            FieldIndex::IntIndex(_)
+            | FieldIndex::DatetimeIndex(_)
+            | FieldIndex::KeywordIndex(_)
+            | FieldIndex::FloatIndex(_)
+            | FieldIndex::GeoIndex(_)
+            | FieldIndex::BoolIndex(_)
+            | FieldIndex::FullTextIndex(_)
+            | FieldIndex::UuidIndex(_)
+            | FieldIndex::UuidMapIndex(_)
+            | FieldIndex::NullIndex(_) => Ok(None),
+        }
+    }
+
     fn get_telemetry_data(&self) -> PayloadIndexTelemetry {
         match self {
             FieldIndex::IntIndex(index) => index.get_telemetry_data(),

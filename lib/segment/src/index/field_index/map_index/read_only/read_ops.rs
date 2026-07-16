@@ -10,6 +10,8 @@ use super::super::read_ops::MapIndexRead;
 use super::super::{IdIter, MapIndexKey};
 use super::ReadOnlyMapIndex;
 use crate::common::operation_error::OperationResult;
+use crate::index::field_index::map_index::read_ops::collect_integer_postings_sequential;
+use crate::index::field_index::{IntegerPostingAtom, IntegerPostingBatch};
 use crate::index::payload_config::StorageType;
 
 /// Dispatcher impl: forwards every [`MapIndexRead`] method to the active
@@ -143,6 +145,27 @@ where
         match self {
             ReadOnlyMapIndex::Appendable(index) => index.telemetry_index_type(),
             ReadOnlyMapIndex::Immutable(index) => index.telemetry_index_type(),
+        }
+    }
+}
+
+impl<S: UniversalRead> ReadOnlyMapIndex<crate::types::IntPayloadType, S> {
+    pub fn batched_integer_postings(
+        &self,
+        atoms: &[IntegerPostingAtom],
+        hw_counter: &HardwareCounterCell,
+    ) -> OperationResult<IntegerPostingBatch> {
+        let single_valued =
+            MapIndexRead::get_values_count(self) == MapIndexRead::get_indexed_points(self);
+
+        match self {
+            ReadOnlyMapIndex::Appendable(index) => Ok(IntegerPostingBatch {
+                postings: collect_integer_postings_sequential(index, atoms, hw_counter),
+                single_valued,
+            }),
+            ReadOnlyMapIndex::Immutable(index) => {
+                index.batched_integer_postings(atoms, hw_counter, single_valued)
+            }
         }
     }
 }
