@@ -75,6 +75,31 @@ impl ReadSegmentEntry for Segment {
         })
     }
 
+    fn search_batch_with_filters(
+        &self,
+        vector_name: &VectorName,
+        query_vectors: &[&QueryVector],
+        with_payload: &WithPayload,
+        with_vector: &WithVector,
+        filters: &[Option<&Filter>],
+        top: usize,
+        params: Option<&SearchParams>,
+        query_context: &SegmentQueryContext,
+    ) -> OperationResult<Vec<Vec<ScoredPoint>>> {
+        self.with_view(|view| {
+            view.search_batch_with_filters(
+                vector_name,
+                query_vectors,
+                with_payload,
+                with_vector,
+                filters,
+                top,
+                params,
+                query_context,
+            )
+        })
+    }
+
     fn rescore_with_formula(
         &self,
         ctx: Arc<FormulaContext>,

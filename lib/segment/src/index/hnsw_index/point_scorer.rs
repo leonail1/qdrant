@@ -8,8 +8,11 @@ use common::generic_consts::Random;
 use common::types::{PointOffsetType, ScoreType, ScoredPointOffset};
 use smallvec::SmallVec;
 
-use crate::common::operation_error::{OperationResult, check_process_stopped};
+use crate::common::operation_error::{OperationError, OperationResult, check_process_stopped};
 use crate::data_types::vectors::QueryVector;
+use crate::index::visited_pool::VisitedListHandle;
+#[cfg(feature = "testing")]
+use crate::index::visited_pool::VisitedPool;
 use crate::payload_storage::FilterContext;
 use crate::vector_storage::common::VECTOR_READ_BATCH_SIZE;
 use crate::vector_storage::quantized::quantized_query_scorer::InternalScorerUnsupported;
@@ -378,6 +381,124 @@ impl<'a> BatchFilteredSearcher<'a> {
         self.peek_top_iter(iter, is_stopped)
     }
 
+    /// Score one candidate stream for a subset of queries while retaining the
+    /// per-query top-k queues across calls.
+    ///
+    /// This is the execution primitive used by factorized eligibility plans:
+    /// a posting list is read once, then scored only by the queries whose
+    /// filters contain that posting's value. `visited_lists` prevents a point
+    /// from being inserted twice for a query when payload values overlap.
+    pub(crate) fn score_points_for_queries(
+        &mut self,
+        mut points: impl Iterator<Item = PointOffsetType>,
+        query_indices: &[usize],
+        visited_lists: &mut [VisitedListHandle<'_>],
+        is_stopped: &AtomicBool,
+    ) -> OperationResult<()> {
+        if query_indices.is_empty() {
+            return Ok(());
+        }
+        if visited_lists.len() != self.scorer_batch.len() {
+            return Err(OperationError::service_error(
+                "factorized batch scorer visited-list count differs from query count",
+            ));
+        }
+        if query_indices
+            .iter()
+            .any(|&query_index| query_index >= self.scorer_batch.len())
+        {
+            return Err(OperationError::service_error(
+                "factorized batch scorer query index is out of bounds",
+            ));
+        }
+
+        let mut chunk = [0; VECTOR_READ_BATCH_SIZE];
+        let mut query_chunk = [0; VECTOR_READ_BATCH_SIZE];
+        let mut scores_buffer = [0.0; VECTOR_READ_BATCH_SIZE];
+
+        loop {
+            check_process_stopped(is_stopped)?;
+
+            let mut chunk_size = 0;
+            for point_id in &mut points {
+                check_process_stopped(is_stopped)?;
+
+                if !self.filters.check_vector(point_id) {
+                    continue;
+                }
+                chunk[chunk_size] = point_id;
+                chunk_size += 1;
+                if chunk_size == VECTOR_READ_BATCH_SIZE {
+                    break;
+                }
+            }
+
+            if chunk_size == 0 {
+                break;
+            }
+
+            for &query_index in query_indices {
+                let mut query_chunk_size = 0;
+                for &point_id in &chunk[..chunk_size] {
+                    if !visited_lists[query_index].check_and_update_visited(point_id) {
+                        query_chunk[query_chunk_size] = point_id;
+                        query_chunk_size += 1;
+                    }
+                }
+                if query_chunk_size == 0 {
+                    continue;
+                }
+
+                let BatchSearch { raw_scorer, pq } = &mut self.scorer_batch[query_index];
+                raw_scorer.score_points(
+                    &query_chunk[..query_chunk_size],
+                    &mut scores_buffer[..query_chunk_size],
+                );
+
+                for i in 0..query_chunk_size {
+                    pq.push(ScoredPointOffset {
+                        idx: query_chunk[i],
+                        score: scores_buffer[i],
+                    });
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    pub(crate) fn into_top(self) -> Vec<Vec<ScoredPointOffset>> {
+        self.scorer_batch
+            .into_iter()
+            .map(|BatchSearch { pq, .. }| pq.into_sorted_vec())
+            .collect()
+    }
+
+    #[cfg(feature = "testing")]
+    pub fn peek_top_factorized_for_test(
+        mut self,
+        postings: &[(Vec<PointOffsetType>, Vec<usize>)],
+        num_points: usize,
+        is_stopped: &AtomicBool,
+    ) -> OperationResult<Vec<Vec<ScoredPointOffset>>> {
+        let visited_pool = VisitedPool::new();
+        let mut visited_lists = (0..self.scorer_batch.len())
+            .map(|_| visited_pool.get(num_points))
+            .collect::<Vec<_>>();
+
+        for (point_ids, query_indices) in postings {
+            self.score_points_for_queries(
+                point_ids.iter().copied(),
+                query_indices,
+                &mut visited_lists,
+                is_stopped,
+            )?;
+        }
+
+        drop(visited_lists);
+        Ok(self.into_top())
+    }
+
     /// This function expects deferred points to be already filtered from the iterator.
     pub fn peek_top_iter(
         mut self,
@@ -422,11 +543,6 @@ impl<'a> BatchFilteredSearcher<'a> {
             }
         }
 
-        let results = self
-            .scorer_batch
-            .into_iter()
-            .map(|BatchSearch { pq, .. }| pq.into_sorted_vec())
-            .collect();
-        Ok(results)
+        Ok(self.into_top())
     }
 }

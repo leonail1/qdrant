@@ -16,7 +16,7 @@ use atomic_refcell::AtomicRefCell;
 use crate::id_tracker::IdTrackerRead;
 use crate::index::field_index::FieldIndexRead;
 use crate::index::payload_config::PayloadConfig;
-use crate::index::visited_pool::VisitedPool;
+use crate::index::visited_pool::{VisitedListHandle, VisitedPool};
 use crate::payload_storage::PayloadStorageRead;
 use crate::types::{PayloadKeyType, VectorNameBuf};
 use crate::vector_storage::VectorStorageRead;
@@ -68,5 +68,9 @@ where
     /// Number of available points -- excludes soft-deleted points.
     pub fn available_point_count(&self) -> usize {
         self.id_tracker.available_point_count()
+    }
+
+    pub(crate) fn visited_list(&self, num_points: usize) -> VisitedListHandle<'_> {
+        self.visited_pool.get(num_points)
     }
 }

@@ -252,6 +252,56 @@ where
             .collect()
     }
 
+    #[allow(clippy::too_many_arguments)]
+    pub fn search_batch_with_filters(
+        &self,
+        vector_name: &VectorName,
+        query_vectors: &[&QueryVector],
+        with_payload: &WithPayload,
+        with_vector: &WithVector,
+        filters: &[Option<&Filter>],
+        top: usize,
+        params: Option<&SearchParams>,
+        query_context: &SegmentQueryContext,
+    ) -> OperationResult<Vec<Vec<ScoredPoint>>> {
+        check_query_vectors(vector_name, query_vectors, self.segment_config)?;
+        if query_vectors.len() != filters.len() {
+            return Err(OperationError::service_error(
+                "query vector count differs from filter count",
+            ));
+        }
+
+        let vector_data = self
+            .vector_data
+            .get(vector_name)
+            .ok_or_else(|| OperationError::vector_name_not_exists(vector_name))?;
+        let vector_query_context = query_context.get_vector_context(vector_name);
+        let internal_results = vector_data.vector_index().search_batch_with_filters(
+            query_vectors,
+            filters,
+            top,
+            params,
+            &vector_query_context,
+        )?;
+
+        check_stopped(&vector_query_context.is_stopped())?;
+
+        let hw_counter = vector_query_context.hardware_counter();
+
+        internal_results
+            .into_iter()
+            .map(|internal_result| {
+                self.process_search_result(
+                    internal_result,
+                    with_payload,
+                    with_vector,
+                    &hw_counter,
+                    &vector_query_context.is_stopped(),
+                )
+            })
+            .collect()
+    }
+
     pub fn fill_query_context(&self, query_context: &mut QueryContext) -> OperationResult<()> {
         query_context.add_available_point_count(self.available_point_count_without_deferred());
         let hw_acc = query_context.hardware_usage_accumulator();

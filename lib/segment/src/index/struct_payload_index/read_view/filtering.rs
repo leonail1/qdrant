@@ -71,6 +71,26 @@ where
         }
     }
 
+    /// Return the payload-index posting iterator for one atomic field
+    /// condition, if a compatible field index exists.
+    ///
+    /// Unlike [`Self::query_field`], this entry point does not require
+    /// constructing a cardinality-estimator `PrimaryCondition`. It is used by
+    /// factorized batch plans that enumerate each shared predicate atom once.
+    pub(crate) fn query_field_condition<'q>(
+        &'q self,
+        field_condition: &'q FieldCondition,
+        hw_counter: &'q HardwareCounterCell,
+    ) -> OperationResult<Option<Box<dyn Iterator<Item = PointOffsetType> + 'q>>> {
+        let Some(field_indexes) = self.field_indexes.get(&field_condition.key) else {
+            return Ok(None);
+        };
+        field_indexes
+            .iter()
+            .find_map(|field_index| field_index.filter(field_condition, hw_counter).transpose())
+            .transpose()
+    }
+
     pub fn struct_filtered_context<'q>(
         &'q self,
         filter: &'q Filter,

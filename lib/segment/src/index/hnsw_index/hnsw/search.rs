@@ -12,11 +12,12 @@ use crate::index::PayloadIndexRead;
 use crate::index::hnsw_index::graph_layers::{GraphLayersWithVectors, SearchAlgorithm};
 use crate::index::hnsw_index::point_scorer::{BatchFilteredSearcher, FilteredScorer};
 use crate::index::query_estimator::adjust_to_available_vectors;
+use crate::index::query_optimization::factorized_filter::FactorizedFilterPlan;
 use crate::index::vector_index_search_common::{
     get_oversampled_top, is_quantized_search, postprocess_search_result,
 };
 use crate::payload_storage::FilterContext;
-use crate::types::{ACORN_MAX_SELECTIVITY_DEFAULT, Filter, SearchParams};
+use crate::types::{ACORN_MAX_SELECTIVITY_DEFAULT, FieldCondition, Filter, Match, SearchParams};
 use crate::vector_storage::quantized::quantized_vectors::QuantizedVectors;
 use crate::vector_storage::query::DiscoverQuery;
 use crate::vector_storage::{VectorStorageEnum, VectorStorageRead, new_raw_scorer};
@@ -322,6 +323,87 @@ impl HNSWIndex {
             params,
             vector_query_context,
         )
+    }
+
+    /// Execute predicate-first exact scoring for a batch of partially
+    /// overlapping integer filters.
+    ///
+    /// Each unique payload atom is enumerated once from Qdrant's payload
+    /// index. The candidate stream is scored only for the queries referencing
+    /// that atom, while per-query visited lists deduplicate multi-value points.
+    ///
+    /// `Ok(None)` means the payload index cannot expose one of the required
+    /// atomic postings and the caller must use the stock fallback.
+    pub(super) fn search_vectors_plain_factorized(
+        &self,
+        vectors: &[&QueryVector],
+        plan: &FactorizedFilterPlan,
+        top: usize,
+        params: Option<&SearchParams>,
+        vector_query_context: &VectorQueryContext,
+    ) -> OperationResult<Option<Vec<Vec<ScoredPointOffset>>>> {
+        let id_tracker = self.id_tracker.borrow();
+        let vector_storage = self.vector_storage.borrow();
+        let quantized_vectors = self.quantized_vectors.borrow();
+        let payload_index = self.payload_index.borrow();
+
+        let deleted_points = vector_query_context
+            .deleted_points()
+            .unwrap_or_else(|| id_tracker.deleted_point_bitslice());
+        let is_stopped = vector_query_context.is_stopped();
+        let oversampled_top = get_oversampled_top(quantized_vectors.as_ref(), params, top);
+        let mut searcher = construct_batch_searcher(
+            vectors,
+            &vector_storage,
+            quantized_vectors.as_ref(),
+            oversampled_top,
+            deleted_points,
+            params,
+            vector_query_context.hardware_counter(),
+            None,
+        )?;
+
+        let hw_counter = vector_query_context.hardware_counter();
+
+        let all_atoms_indexed = payload_index.with_view(|view| {
+            let mut visited_lists = (0..vectors.len())
+                .map(|_| view.visited_list(id_tracker.total_point_count()))
+                .collect::<Vec<_>>();
+            for atom in plan.atoms() {
+                let condition =
+                    FieldCondition::new_match(plan.key().clone(), Match::from(atom.value()));
+                let Some(points) = view.query_field_condition(&condition, &hw_counter)? else {
+                    return Ok::<bool, crate::common::operation_error::OperationError>(false);
+                };
+                searcher.score_points_for_queries(
+                    points,
+                    atom.query_indices(),
+                    &mut visited_lists,
+                    &is_stopped,
+                )?;
+            }
+            drop(visited_lists);
+            Ok(true)
+        })?;
+
+        if !all_atoms_indexed {
+            return Ok(None);
+        }
+
+        let mut search_results = searcher.into_top();
+        for (search_result, query_vector) in search_results.iter_mut().zip(vectors) {
+            *search_result = postprocess_search_result(
+                std::mem::take(search_result),
+                id_tracker.deleted_point_bitslice(),
+                &vector_storage,
+                quantized_vectors.as_ref(),
+                query_vector,
+                params,
+                top,
+                vector_query_context.hardware_counter(),
+            )?;
+        }
+        Ok(Some(search_results))
     }
 
     fn discover_search_with_graph(

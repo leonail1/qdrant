@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 use std::path::PathBuf;
+use std::sync::LazyLock;
 
 use common::counter::hardware_counter::HardwareCounterCell;
 use common::types::{PointOffsetType, ScoredPointOffset, TelemetryDetail};
@@ -13,11 +14,18 @@ use crate::data_types::vectors::{QueryVector, VectorRef};
 use crate::id_tracker::IdTrackerRead;
 use crate::index::hnsw_index::config::HnswGraphConfig;
 use crate::index::query_estimator::adjust_to_available_vectors;
+use crate::index::query_optimization::factorized_filter::FactorizedFilterPlan;
 use crate::index::sample_estimation::sample_check_cardinality;
 use crate::index::{PayloadIndexRead, VectorIndex, VectorIndexRead};
 use crate::telemetry::VectorIndexSearchesTelemetry;
 use crate::types::{Filter, QuantizationSearchParams, SearchParams};
 use crate::vector_storage::VectorStorageRead;
+
+static FACTORIZED_FILTER_BATCH_ENABLED: LazyLock<bool> = LazyLock::new(|| {
+    std::env::var("QDRANT_COOP_FACTORIZED_FILTER")
+        .map(|value| !matches!(value.as_str(), "0" | "false" | "off"))
+        .unwrap_or(true)
+});
 
 impl VectorIndexRead for HNSWIndex {
     fn search(
@@ -172,6 +180,121 @@ impl VectorIndexRead for HNSWIndex {
                 }
             }
         }
+    }
+
+    fn search_batch_with_filters(
+        &self,
+        vectors: &[&QueryVector],
+        filters: &[Option<&Filter>],
+        top: usize,
+        params: Option<&SearchParams>,
+        query_context: &VectorQueryContext,
+    ) -> OperationResult<Vec<Vec<ScoredPointOffset>>> {
+        if vectors.len() != filters.len() {
+            return Err(OperationError::service_error(
+                "query vector count differs from filter count",
+            ));
+        }
+        if vectors.is_empty() || top == 0 {
+            return Ok(vec![vec![]; vectors.len()]);
+        }
+
+        let first_filter = filters[0];
+        if filters.iter().all(|filter| *filter == first_filter) {
+            return self.search(vectors, first_filter, top, params, query_context);
+        }
+
+        let search_independently = || {
+            vectors
+                .iter()
+                .zip(filters)
+                .map(|(&vector, &filter)| {
+                    self.search(&[vector], filter, top, params, query_context)
+                        .map(|mut result| result.pop().unwrap_or_default())
+                })
+                .collect()
+        };
+
+        // Keep the disabled and unsupported paths identical to stock: do not
+        // estimate cardinality or retain a combined segment read lock merely
+        // because the public request happened to use QueryBatch.
+        if !*FACTORIZED_FILTER_BATCH_ENABLED {
+            return search_independently();
+        }
+
+        let Some(filter_refs) = filters.iter().copied().collect::<Option<Vec<_>>>() else {
+            return search_independently();
+        };
+        let Ok(plan) = FactorizedFilterPlan::try_from_filter_refs(&filter_refs) else {
+            return search_independently();
+        };
+
+        // A single-query direct atomic-posting path can still avoid general
+        // filter-evaluator overhead. Multi-query factorization, however, must
+        // eliminate at least one repeated atom access or it only adds masks and
+        // visited-list overhead.
+        if vectors.len() > 1 && plan.atom_reference_count() <= plan.atoms().len() {
+            return search_independently();
+        }
+
+        let exact = params.is_some_and(|params| params.exact);
+        let is_hnsw_disabled = self.config.m == 0 && self.config.payload_m.unwrap_or(0) == 0;
+
+        let all_plain = if exact || is_hnsw_disabled {
+            true
+        } else {
+            let payload_index = self.payload_index.borrow();
+            let vector_storage = self.vector_storage.borrow();
+            let id_tracker = self.id_tracker.borrow();
+            let available_vector_count = vector_storage.available_vector_count();
+            let available_point_count = id_tracker.available_point_count();
+            let hw_counter = query_context.hardware_counter();
+
+            filter_refs.iter().try_fold(true, |all_plain, filter| {
+                if !all_plain {
+                    return Ok(false);
+                }
+                let point_cardinality = payload_index
+                    .with_view(|view| view.estimate_cardinality(filter, &hw_counter))?;
+                let cardinality = adjust_to_available_vectors(
+                    point_cardinality,
+                    available_vector_count,
+                    available_point_count,
+                );
+                Ok::<_, OperationError>(cardinality.max < self.config.full_scan_threshold)
+            })?
+        };
+        if !all_plain {
+            return search_independently();
+        }
+
+        let exact_params = if exact {
+            params.map(|params| {
+                let mut params = *params;
+                params.quantization = Some(QuantizationSearchParams {
+                    ignore: true,
+                    rescore: Some(false),
+                    oversampling: None,
+                });
+                params
+            })
+        } else {
+            None
+        };
+        let params_ref = if exact { exact_params.as_ref() } else { params };
+        let _timer = ScopeDurationMeasurer::new(if exact {
+            &self.searches_telemetry.exact_filtered
+        } else {
+            &self.searches_telemetry.small_cardinality
+        });
+
+        if let Some(result) =
+            self.search_vectors_plain_factorized(vectors, &plan, top, params_ref, query_context)?
+        {
+            return Ok(result);
+        }
+
+        search_independently()
     }
 
     fn get_telemetry_data(&self, detail: TelemetryDetail) -> VectorIndexSearchesTelemetry {

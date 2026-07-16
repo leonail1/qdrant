@@ -56,6 +56,64 @@ pub trait ReadSegmentEntry {
         query_context: &SegmentQueryContext,
     ) -> OperationResult<Vec<Vec<ScoredPoint>>>;
 
+    /// Search a batch whose queries may use different filters.
+    ///
+    /// Concrete segments can override this to share payload-index and vector
+    /// work. Wrappers and proxy segments inherit a correctness-first fallback.
+    #[allow(clippy::too_many_arguments)]
+    fn search_batch_with_filters(
+        &self,
+        vector_name: &VectorName,
+        query_vectors: &[&QueryVector],
+        with_payload: &WithPayload,
+        with_vector: &WithVector,
+        filters: &[Option<&Filter>],
+        top: usize,
+        params: Option<&SearchParams>,
+        query_context: &SegmentQueryContext,
+    ) -> OperationResult<Vec<Vec<ScoredPoint>>> {
+        if query_vectors.len() != filters.len() {
+            return Err(OperationError::service_error(
+                "query vector count differs from filter count",
+            ));
+        }
+        if query_vectors.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let first_filter = filters[0];
+        if filters.iter().all(|filter| *filter == first_filter) {
+            return self.search_batch(
+                vector_name,
+                query_vectors,
+                with_payload,
+                with_vector,
+                first_filter,
+                top,
+                params,
+                query_context,
+            );
+        }
+
+        query_vectors
+            .iter()
+            .zip(filters)
+            .map(|(&query_vector, &filter)| {
+                self.search_batch(
+                    vector_name,
+                    &[query_vector],
+                    with_payload,
+                    with_vector,
+                    filter,
+                    top,
+                    params,
+                    query_context,
+                )
+                .map(|mut result| result.pop().unwrap_or_default())
+            })
+            .collect()
+    }
+
     /// Rescore results with a formula that can reference payload values.
     ///
     /// A deleted bitslice is passed to exclude points from a wrapped segment.

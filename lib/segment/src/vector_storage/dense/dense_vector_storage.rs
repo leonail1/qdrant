@@ -671,6 +671,82 @@ mod tests {
         assert!(closest.is_empty(), "must have no results, all deleted");
     }
 
+    #[test]
+    fn test_factorized_batch_scoring_matches_independent_candidate_sets() {
+        let dir = Builder::new().prefix("storage_dir").tempdir().unwrap();
+        let points = [
+            vec![1.0, 0.0, 0.0, 0.0],
+            vec![0.8, 0.2, 0.0, 0.0],
+            vec![0.0, 1.0, 0.0, 0.0],
+            vec![0.0, 0.8, 0.2, 0.0],
+            vec![0.0, 0.0, 1.0, 0.0],
+        ];
+        let queries: Vec<QueryVector> =
+            vec![points[0].as_slice().into(), points[2].as_slice().into()];
+        let id_tracker = create_id_tracker_fixture(points.len());
+        let mut storage = open_dense_vector_storage(dir.path(), 4, Distance::Dot, false).unwrap();
+        let hw_counter = HardwareCounterCell::new();
+
+        {
+            let mut volatile = new_volatile_dense_vector_storage(4, Distance::Dot);
+            for (idx, vector) in points.iter().enumerate() {
+                volatile
+                    .insert_vector(
+                        idx as PointOffsetType,
+                        vector.as_slice().into(),
+                        &hw_counter,
+                    )
+                    .unwrap();
+            }
+            let mut iter = (0..points.len()).map(|idx| {
+                let idx = idx as PointOffsetType;
+                (volatile.get_vector::<Random>(idx), false)
+            });
+            storage.update_from(&mut iter, &Default::default()).unwrap();
+        }
+
+        let expected_query_0 = BatchFilteredSearcher::new_for_test(
+            &[queries[0].clone()],
+            &storage,
+            id_tracker.deleted_point_bitslice(),
+            3,
+        )
+        .peek_top_iter([0, 1, 2].into_iter(), &DEFAULT_STOPPED)
+        .unwrap()
+        .remove(0);
+        let expected_query_1 = BatchFilteredSearcher::new_for_test(
+            &[queries[1].clone()],
+            &storage,
+            id_tracker.deleted_point_bitslice(),
+            3,
+        )
+        .peek_top_iter([0, 1, 2, 3, 4].into_iter(), &DEFAULT_STOPPED)
+        .unwrap()
+        .remove(0);
+
+        let factorized = BatchFilteredSearcher::new_for_test(
+            &queries,
+            &storage,
+            id_tracker.deleted_point_bitslice(),
+            3,
+        );
+        assert_eq!(
+            factorized
+                .peek_top_factorized_for_test(
+                    &[
+                        (vec![0, 1, 2], vec![0, 1]),
+                        // Point 2 is intentionally present in both postings
+                        // for query 1. The visited list must deduplicate it.
+                        (vec![2, 3, 4], vec![1]),
+                    ],
+                    points.len(),
+                    &DEFAULT_STOPPED,
+                )
+                .unwrap(),
+            vec![expected_query_0, expected_query_1]
+        );
+    }
+
     /// Test that deleted points are properly transferred when updating from other storage.
     #[test]
     fn test_update_from_delete_points() {

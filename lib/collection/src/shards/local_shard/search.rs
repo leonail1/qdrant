@@ -1,4 +1,4 @@
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock};
 use std::time::Duration;
 
 use common::counter::hardware_accumulator::HwMeasurementAcc;
@@ -26,6 +26,17 @@ use crate::operations::types::{CollectionError, CollectionResult};
 // See: <https://github.com/qdrant/qdrant/pull/6326>
 const CHUNK_SIZE: usize = 16;
 
+/// Cooperative groups with distinct filters need enough parallel groups to
+/// use the shard's search threads. Keep this configurable for controlled
+/// scheduler/operator ablations without changing the public API.
+static DISTINCT_FILTER_CHUNK_SIZE: LazyLock<usize> = LazyLock::new(|| {
+    std::env::var("QDRANT_COOP_DISTINCT_FILTER_CHUNK_SIZE")
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(CHUNK_SIZE)
+        .clamp(1, CHUNK_SIZE)
+});
+
 impl LocalShard {
     pub async fn do_search(
         &self,
@@ -38,7 +49,18 @@ impl LocalShard {
             return Ok(vec![]);
         }
 
-        let skip_batching = if core_request.searches.len() <= CHUNK_SIZE {
+        let first_filter = core_request.searches[0].filter.as_ref();
+        let all_filters_equal = core_request
+            .searches
+            .iter()
+            .all(|search| search.filter.as_ref() == first_filter);
+        let chunk_size = if all_filters_equal {
+            CHUNK_SIZE
+        } else {
+            *DISTINCT_FILTER_CHUNK_SIZE
+        };
+
+        let skip_batching = if core_request.searches.len() <= chunk_size {
             // Don't batch if we have few searches, prevents cloning request
             true
         } else if self.segments.read().len() > self.shared_storage_config.search_thread_count {
@@ -72,7 +94,7 @@ impl LocalShard {
         let CoreSearchRequestBatch { searches } = core_request.as_ref();
 
         let chunk_futures = searches
-            .chunks(CHUNK_SIZE)
+            .chunks(chunk_size)
             .map(|chunk| {
                 let core_request = CoreSearchRequestBatch {
                     searches: chunk.to_vec(),

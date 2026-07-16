@@ -14,7 +14,7 @@ use sparse::index::inverted_index::inverted_index_ram::InvertedIndexRam;
 use super::hnsw_index::hnsw::HNSWIndex;
 use super::plain_vector_index::PlainVectorIndex;
 use super::sparse_index::sparse_vector_index::SparseVectorIndex;
-use crate::common::operation_error::OperationResult;
+use crate::common::operation_error::{OperationError, OperationResult};
 use crate::data_types::query_context::VectorQueryContext;
 use crate::data_types::vectors::{QueryVector, VectorRef};
 use crate::telemetry::VectorIndexSearchesTelemetry;
@@ -35,6 +35,43 @@ pub trait VectorIndexRead {
         params: Option<&SearchParams>,
         query_context: &VectorQueryContext,
     ) -> OperationResult<Vec<Vec<ScoredPointOffset>>>;
+
+    /// Search a batch whose queries may use different filters.
+    ///
+    /// Implementations may override this to share work across partially
+    /// overlapping filters. The default preserves the existing same-filter
+    /// fast path and otherwise evaluates each query independently.
+    fn search_batch_with_filters(
+        &self,
+        vectors: &[&QueryVector],
+        filters: &[Option<&Filter>],
+        top: usize,
+        params: Option<&SearchParams>,
+        query_context: &VectorQueryContext,
+    ) -> OperationResult<Vec<Vec<ScoredPointOffset>>> {
+        if vectors.len() != filters.len() {
+            return Err(OperationError::service_error(
+                "query vector count differs from filter count",
+            ));
+        }
+        if vectors.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let first_filter = filters[0];
+        if filters.iter().all(|filter| *filter == first_filter) {
+            return self.search(vectors, first_filter, top, params, query_context);
+        }
+
+        vectors
+            .iter()
+            .zip(filters)
+            .map(|(&vector, &filter)| {
+                self.search(&[vector], filter, top, params, query_context)
+                    .map(|mut result| result.pop().unwrap_or_default())
+            })
+            .collect()
+    }
 
     fn get_telemetry_data(&self, detail: TelemetryDetail) -> VectorIndexSearchesTelemetry;
 
@@ -199,6 +236,45 @@ impl VectorIndexRead for VectorIndexEnum {
             }
             VectorIndexEnum::SparseCompressedMmapU8(index) => {
                 index.search(vectors, filter, top, params, query_context)
+            }
+        }
+    }
+
+    fn search_batch_with_filters(
+        &self,
+        vectors: &[&QueryVector],
+        filters: &[Option<&Filter>],
+        top: usize,
+        params: Option<&SearchParams>,
+        query_context: &VectorQueryContext,
+    ) -> OperationResult<Vec<Vec<ScoredPointOffset>>> {
+        match self {
+            VectorIndexEnum::Plain(index) => {
+                index.search_batch_with_filters(vectors, filters, top, params, query_context)
+            }
+            VectorIndexEnum::Hnsw(index) => {
+                index.search_batch_with_filters(vectors, filters, top, params, query_context)
+            }
+            VectorIndexEnum::SparseRam(index) => {
+                index.search_batch_with_filters(vectors, filters, top, params, query_context)
+            }
+            VectorIndexEnum::SparseCompressedImmutableRamF32(index) => {
+                index.search_batch_with_filters(vectors, filters, top, params, query_context)
+            }
+            VectorIndexEnum::SparseCompressedImmutableRamF16(index) => {
+                index.search_batch_with_filters(vectors, filters, top, params, query_context)
+            }
+            VectorIndexEnum::SparseCompressedImmutableRamU8(index) => {
+                index.search_batch_with_filters(vectors, filters, top, params, query_context)
+            }
+            VectorIndexEnum::SparseCompressedMmapF32(index) => {
+                index.search_batch_with_filters(vectors, filters, top, params, query_context)
+            }
+            VectorIndexEnum::SparseCompressedMmapF16(index) => {
+                index.search_batch_with_filters(vectors, filters, top, params, query_context)
+            }
+            VectorIndexEnum::SparseCompressedMmapU8(index) => {
+                index.search_batch_with_filters(vectors, filters, top, params, query_context)
             }
         }
     }

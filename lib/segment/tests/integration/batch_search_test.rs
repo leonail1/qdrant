@@ -217,4 +217,135 @@ fn test_batch_and_single_request_equivalency() {
         assert_eq!(search_res_1[0], batch_res[0]);
         assert_eq!(search_res_2[0], batch_res[1]);
     }
+
+    for _ in 0..10 {
+        let query_vector_1 = random_vector(&mut rng, dim).into();
+        let query_vector_2 = random_vector(&mut rng, dim).into();
+        let values = random_int_payload(&mut rng, 3..=3);
+
+        let filter_1 = Filter::new_must(Condition::Field(FieldCondition::new_match(
+            JsonPath::new(int_key),
+            vec![values[0], values[1]].into(),
+        )));
+        let filter_2 = Filter::new_must(Condition::Field(FieldCondition::new_match(
+            JsonPath::new(int_key),
+            vec![values[1], values[2]].into(),
+        )));
+
+        let search_res_1 = hnsw_index
+            .search(
+                &[&query_vector_1],
+                Some(&filter_1),
+                10,
+                None,
+                &Default::default(),
+            )
+            .unwrap();
+        let search_res_2 = hnsw_index
+            .search(
+                &[&query_vector_2],
+                Some(&filter_2),
+                10,
+                None,
+                &Default::default(),
+            )
+            .unwrap();
+
+        let batch_res = hnsw_index
+            .search_batch_with_filters(
+                &[&query_vector_1, &query_vector_2],
+                &[Some(&filter_1), Some(&filter_2)],
+                10,
+                None,
+                &Default::default(),
+            )
+            .unwrap();
+
+        assert_eq!(search_res_1[0], batch_res[0]);
+        assert_eq!(search_res_2[0], batch_res[1]);
+    }
+
+    // A zero query gives every eligible point the same score. Preserve the
+    // original MatchAny atom order so the top-k boundary matches stock search
+    // even when the shared order is not numerically sorted.
+    let tie_query_1 = vec![0.0; dim].into();
+    let tie_query_2 = vec![0.0; dim].into();
+    let tie_filter_1 = Filter::new_must(Condition::Field(FieldCondition::new_match(
+        JsonPath::new(int_key),
+        vec![1_i64, 0_i64].into(),
+    )));
+    let tie_filter_2 = Filter::new_must(Condition::Field(FieldCondition::new_match(
+        JsonPath::new(int_key),
+        vec![1_i64].into(),
+    )));
+
+    let tie_search_res_1 = hnsw_index
+        .search(
+            &[&tie_query_1],
+            Some(&tie_filter_1),
+            1,
+            None,
+            &Default::default(),
+        )
+        .unwrap();
+    let tie_search_res_2 = hnsw_index
+        .search(
+            &[&tie_query_2],
+            Some(&tie_filter_2),
+            1,
+            None,
+            &Default::default(),
+        )
+        .unwrap();
+    let tie_batch_res = hnsw_index
+        .search_batch_with_filters(
+            &[&tie_query_1, &tie_query_2],
+            &[Some(&tie_filter_1), Some(&tie_filter_2)],
+            1,
+            None,
+            &Default::default(),
+        )
+        .unwrap();
+
+    assert_eq!(tie_search_res_1[0], tie_batch_res[0]);
+    assert_eq!(tie_search_res_2[0], tie_batch_res[1]);
+
+    // Conflicting atom orders cannot share one globally ordered stream and
+    // therefore must fail closed to independent stock execution.
+    let conflicting_filter = Filter::new_must(Condition::Field(FieldCondition::new_match(
+        JsonPath::new(int_key),
+        vec![0_i64, 1_i64].into(),
+    )));
+    let conflicting_query_1 = random_vector(&mut rng, dim).into();
+    let conflicting_query_2 = random_vector(&mut rng, dim).into();
+    let conflicting_search_res_1 = hnsw_index
+        .search(
+            &[&conflicting_query_1],
+            Some(&tie_filter_1),
+            1,
+            None,
+            &Default::default(),
+        )
+        .unwrap();
+    let conflicting_search_res = hnsw_index
+        .search(
+            &[&conflicting_query_2],
+            Some(&conflicting_filter),
+            1,
+            None,
+            &Default::default(),
+        )
+        .unwrap();
+    let conflicting_batch_res = hnsw_index
+        .search_batch_with_filters(
+            &[&conflicting_query_1, &conflicting_query_2],
+            &[Some(&tie_filter_1), Some(&conflicting_filter)],
+            1,
+            None,
+            &Default::default(),
+        )
+        .unwrap();
+
+    assert_eq!(conflicting_search_res_1[0], conflicting_batch_res[0]);
+    assert_eq!(conflicting_search_res[0], conflicting_batch_res[1]);
 }

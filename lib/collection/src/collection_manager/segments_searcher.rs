@@ -1,5 +1,5 @@
 use std::collections::BTreeSet;
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock};
 use std::time::{Duration, Instant};
 
 use ahash::AHashMap;
@@ -13,6 +13,7 @@ use segment::common::operation_error::OperationError;
 use segment::data_types::modifier::Modifier;
 use segment::data_types::query_context::{FormulaContext, QueryContext, SegmentQueryContext};
 use segment::data_types::vectors::QueryVector;
+use segment::index::query_optimization::factorized_filter::FactorizedFilterPlan;
 use segment::types::{
     Filter, Indexes, PointIdType, ScoredPoint, SearchParams, SegmentConfig, VectorName,
     WithPayload, WithPayloadInterface, WithVector,
@@ -44,6 +45,12 @@ type BatchSearchResult = Vec<SegmentBatchSearchResult>;
 
 // Result of batch search in one segment
 type SegmentSearchExecutedResult = CollectionResult<(SegmentBatchSearchResult, Vec<bool>)>;
+
+static FACTORIZED_FILTER_BATCH_ENABLED: LazyLock<bool> = LazyLock::new(|| {
+    std::env::var("QDRANT_COOP_FACTORIZED_FILTER")
+        .map(|value| !matches!(value.as_str(), "0" | "false" | "off"))
+        .unwrap_or(true)
+});
 
 /// Simple implementation of segment manager
 ///  - rebuild segment for memory optimization purposes
@@ -560,7 +567,6 @@ impl From<&QueryEnum> for SearchType {
 struct BatchSearchParams<'a> {
     pub search_type: SearchType,
     pub vector_name: &'a VectorName,
-    pub filter: Option<&'a Filter>,
     pub with_payload: WithPayload,
     pub with_vector: WithVector,
     pub top: usize,
@@ -630,6 +636,7 @@ fn search_in_segment(
     let mut result: Vec<Vec<ScoredPoint>> = Vec::with_capacity(batch_size);
     let mut further_results: Vec<bool> = Vec::with_capacity(batch_size); // if segment have more points to return
     let mut vectors_batch: Vec<QueryVector> = vec![];
+    let mut filters_batch: Vec<Option<&Filter>> = vec![];
     let mut prev_params = BatchSearchParams::default();
 
     for search_query in &request.searches {
@@ -641,7 +648,6 @@ fn search_in_segment(
         let params = BatchSearchParams {
             search_type: search_query.query.as_ref().into(),
             vector_name: search_query.query.get_vector_name(),
-            filter: search_query.filter.as_ref(),
             with_payload: WithPayload::from(with_payload_interface),
             with_vector: search_query.with_vector.clone().unwrap_or_default(),
             top: search_query.limit + search_query.offset,
@@ -653,6 +659,7 @@ fn search_in_segment(
         // same params enables batching (cmp expensive on large filters)
         if params == prev_params {
             vectors_batch.push(query);
+            filters_batch.push(search_query.filter.as_ref());
         } else {
             // different params means different batches
             // execute what has been batched so far
@@ -660,6 +667,7 @@ fn search_in_segment(
                 let (mut res, mut further) = execute_batch_search(
                     &segment,
                     &vectors_batch,
+                    &filters_batch,
                     &prev_params,
                     use_sampling,
                     segment_query_context,
@@ -667,10 +675,12 @@ fn search_in_segment(
                 )?;
                 further_results.append(&mut further);
                 result.append(&mut res);
-                vectors_batch.clear()
+                vectors_batch.clear();
+                filters_batch.clear();
             }
             // start new batch for current search query
             vectors_batch.push(query);
+            filters_batch.push(search_query.filter.as_ref());
             prev_params = params;
         }
     }
@@ -680,6 +690,7 @@ fn search_in_segment(
         let (mut res, mut further) = execute_batch_search(
             &segment,
             &vectors_batch,
+            &filters_batch,
             &prev_params,
             use_sampling,
             segment_query_context,
@@ -695,6 +706,99 @@ fn search_in_segment(
 fn execute_batch_search(
     segment: &LockedSegment,
     vectors_batch: &[QueryVector],
+    filters_batch: &[Option<&Filter>],
+    search_params: &BatchSearchParams,
+    use_sampling: bool,
+    segment_query_context: &SegmentQueryContext,
+    timeout: Duration,
+) -> CollectionResult<(Vec<Vec<ScoredPoint>>, Vec<bool>)> {
+    if vectors_batch.len() != filters_batch.len() {
+        return Err(CollectionError::service_error(
+            "query vector count differs from filter count",
+        ));
+    }
+
+    if factorized_filter_batch_is_eligible(filters_batch) {
+        execute_factorized_batch_search(
+            segment,
+            vectors_batch,
+            filters_batch,
+            search_params,
+            use_sampling,
+            segment_query_context,
+            timeout,
+        )
+    } else {
+        execute_stock_filter_groups(
+            segment,
+            vectors_batch,
+            filters_batch,
+            search_params,
+            use_sampling,
+            segment_query_context,
+            timeout,
+        )
+    }
+}
+
+fn factorized_filter_batch_is_eligible(filters_batch: &[Option<&Filter>]) -> bool {
+    if !*FACTORIZED_FILTER_BATCH_ENABLED || filters_batch.is_empty() {
+        return false;
+    }
+
+    let Some(filter_refs) = filters_batch.iter().copied().collect::<Option<Vec<_>>>() else {
+        return false;
+    };
+    let Ok(plan) = FactorizedFilterPlan::try_from_filter_refs(&filter_refs) else {
+        return false;
+    };
+
+    filters_batch.len() == 1 || plan.atom_reference_count() > plan.atoms().len()
+}
+
+/// Restore stock Qdrant grouping and lock scope when the cooperative operator
+/// is disabled, unsupported, or cannot eliminate any repeated atom access.
+fn execute_stock_filter_groups(
+    segment: &LockedSegment,
+    vectors_batch: &[QueryVector],
+    filters_batch: &[Option<&Filter>],
+    search_params: &BatchSearchParams,
+    use_sampling: bool,
+    segment_query_context: &SegmentQueryContext,
+    timeout: Duration,
+) -> CollectionResult<(Vec<Vec<ScoredPoint>>, Vec<bool>)> {
+    let mut results = Vec::with_capacity(vectors_batch.len());
+    let mut further_results = Vec::with_capacity(vectors_batch.len());
+    let mut start = 0;
+
+    while start < vectors_batch.len() {
+        let filter = filters_batch[start];
+        let mut end = start + 1;
+        while end < vectors_batch.len() && filters_batch[end] == filter {
+            end += 1;
+        }
+
+        let (mut group_results, mut group_further) = execute_stock_batch_search(
+            segment,
+            &vectors_batch[start..end],
+            filter,
+            search_params,
+            use_sampling,
+            segment_query_context,
+            timeout,
+        )?;
+        results.append(&mut group_results);
+        further_results.append(&mut group_further);
+        start = end;
+    }
+
+    Ok((results, further_results))
+}
+
+fn execute_stock_batch_search(
+    segment: &LockedSegment,
+    vectors_batch: &[QueryVector],
+    filter: Option<&Filter>,
     search_params: &BatchSearchParams,
     use_sampling: bool,
     segment_query_context: &SegmentQueryContext,
@@ -729,7 +833,61 @@ fn execute_batch_search(
         vectors_batch,
         &search_params.with_payload,
         &search_params.with_vector,
-        search_params.filter,
+        filter,
+        top,
+        search_params.params,
+        segment_query_context,
+    )?;
+
+    drop(read_segment);
+
+    let further_results = res
+        .iter()
+        .map(|batch_result| batch_result.len() == top)
+        .collect();
+
+    Ok((res, further_results))
+}
+
+fn execute_factorized_batch_search(
+    segment: &LockedSegment,
+    vectors_batch: &[QueryVector],
+    filters_batch: &[Option<&Filter>],
+    search_params: &BatchSearchParams,
+    use_sampling: bool,
+    segment_query_context: &SegmentQueryContext,
+    timeout: Duration,
+) -> CollectionResult<(Vec<Vec<ScoredPoint>>, Vec<bool>)> {
+    let locked_segment = segment.get();
+    let Some(read_segment) = locked_segment.try_read_for(timeout) else {
+        return Err(CollectionError::timeout(timeout, "factorized batch search"));
+    };
+
+    let segment_points = read_segment.available_point_count_without_deferred();
+    let segment_config = read_segment.config();
+
+    let top = if use_sampling {
+        let ef_limit = search_params
+            .params
+            .and_then(|p| p.hnsw_ef)
+            .or_else(|| get_hnsw_ef_construct(segment_config, search_params.vector_name));
+        sampling_limit(
+            search_params.top,
+            ef_limit,
+            segment_points,
+            segment_query_context.available_point_count(),
+        )
+    } else {
+        search_params.top
+    };
+
+    let vectors_batch = &vectors_batch.iter().collect_vec();
+    let res = read_segment.search_batch_with_filters(
+        search_params.vector_name,
+        vectors_batch,
+        &search_params.with_payload,
+        &search_params.with_vector,
+        filters_batch,
         top,
         search_params.params,
         segment_query_context,
