@@ -1,7 +1,8 @@
 use std::fmt;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
-use common::fixed_length_priority_queue::FixedLengthPriorityQueue;
+use common::top_k::TopK;
 use common::types::{PointOffsetType, ScoredPointOffset};
 use parking_lot::Mutex;
 
@@ -10,6 +11,95 @@ use super::gpu_vector_storage::GpuVectorStorage;
 use super::shader_builder::ShaderBuilder;
 use crate::common::operation_error::{OperationError, OperationResult};
 use crate::vector_storage::VectorStorageRead;
+
+#[derive(Default)]
+struct GpuExactSearchStats {
+    total_queries: AtomicU64,
+    window_queries: AtomicU64,
+    candidates: AtomicU64,
+    predicate_ns: AtomicU64,
+    visibility_ns: AtomicU64,
+    cache_ns: AtomicU64,
+    prepare_ns: AtomicU64,
+    h2d_ns: AtomicU64,
+    gpu_d2h_ns: AtomicU64,
+    download_ns: AtomicU64,
+    cpu_topk_ns: AtomicU64,
+    postprocess_ns: AtomicU64,
+}
+
+impl GpuExactSearchStats {
+    fn add(atomic: &AtomicU64, value: u64) {
+        atomic.fetch_add(value, Ordering::Relaxed);
+    }
+
+    fn record_inner(
+        &self,
+        candidates: usize,
+        prepare_ns: u64,
+        h2d_ns: u64,
+        gpu_d2h_ns: u64,
+        download_ns: u64,
+        cpu_topk_ns: u64,
+    ) {
+        Self::add(&self.candidates, candidates as u64);
+        Self::add(&self.prepare_ns, prepare_ns);
+        Self::add(&self.h2d_ns, h2d_ns);
+        Self::add(&self.gpu_d2h_ns, gpu_d2h_ns);
+        Self::add(&self.download_ns, download_ns);
+        Self::add(&self.cpu_topk_ns, cpu_topk_ns);
+    }
+
+    fn record_outer(
+        &self,
+        predicate_ns: u64,
+        visibility_ns: u64,
+        cache_ns: u64,
+        postprocess_ns: u64,
+    ) {
+        Self::add(&self.predicate_ns, predicate_ns);
+        Self::add(&self.visibility_ns, visibility_ns);
+        Self::add(&self.cache_ns, cache_ns);
+        Self::add(&self.postprocess_ns, postprocess_ns);
+
+        let sequence = self.total_queries.fetch_add(1, Ordering::Relaxed) + 1;
+        self.window_queries.fetch_add(1, Ordering::Relaxed);
+        if sequence != 1 && !sequence.is_multiple_of(1_024) {
+            return;
+        }
+
+        let queries = self.window_queries.swap(0, Ordering::Relaxed).max(1);
+        let take = |value: &AtomicU64| value.swap(0, Ordering::Relaxed);
+        let candidates = take(&self.candidates);
+        let predicate_ns = take(&self.predicate_ns);
+        let visibility_ns = take(&self.visibility_ns);
+        let cache_ns = take(&self.cache_ns);
+        let prepare_ns = take(&self.prepare_ns);
+        let h2d_ns = take(&self.h2d_ns);
+        let gpu_d2h_ns = take(&self.gpu_d2h_ns);
+        let download_ns = take(&self.download_ns);
+        let cpu_topk_ns = take(&self.cpu_topk_ns);
+        let postprocess_ns = take(&self.postprocess_ns);
+        let average_us = |value: u64| value as f64 / queries as f64 / 1_000.0;
+
+        log::info!(
+            "GPU exact filtered breakdown: sequence={sequence}, window_queries={queries}, \
+             avg_candidates={:.1}, predicate_us={:.3}, visibility_us={:.3}, cache_us={:.3}, \
+             prepare_us={:.3}, h2d_us={:.3}, gpu_d2h_us={:.3}, mapped_download_us={:.3}, \
+             cpu_topk_us={:.3}, postprocess_us={:.3}",
+            candidates as f64 / queries as f64,
+            average_us(predicate_ns),
+            average_us(visibility_ns),
+            average_us(cache_ns),
+            average_us(prepare_ns),
+            average_us(h2d_ns),
+            average_us(gpu_d2h_ns),
+            average_us(download_ns),
+            average_us(cpu_topk_ns),
+            average_us(postprocess_ns),
+        );
+    }
+}
 
 struct GpuExactSearchContext {
     context: gpu::Context,
@@ -22,6 +112,7 @@ struct GpuExactSearchContext {
     query_staging: Arc<gpu::Buffer>,
     score_buffer: Arc<gpu::Buffer>,
     score_staging: Arc<gpu::Buffer>,
+    stats: Arc<GpuExactSearchStats>,
     candidate_capacity: usize,
     query_capacity: usize,
 }
@@ -33,6 +124,7 @@ impl GpuExactSearchContext {
         descriptor_set_layout: Arc<gpu::DescriptorSetLayout>,
         candidate_capacity: usize,
         queue_index: usize,
+        stats: Arc<GpuExactSearchStats>,
     ) -> OperationResult<Self> {
         let device = vector_storage.device();
         let candidate_bytes = candidate_capacity * std::mem::size_of::<PointOffsetType>();
@@ -93,6 +185,7 @@ impl GpuExactSearchContext {
             query_staging,
             score_buffer,
             score_staging,
+            stats,
             candidate_capacity,
             query_capacity,
         })
@@ -118,10 +211,14 @@ impl GpuExactSearchContext {
             return Ok(Vec::new());
         }
 
+        let prepare_started = std::time::Instant::now();
         let mut padded_query = vec![0.0f32; self.query_capacity];
         padded_query[..query.len()].copy_from_slice(query);
         self.candidate_staging.upload(candidates, 0)?;
         self.query_staging.upload(padded_query.as_slice(), 0)?;
+        let prepare_ns = prepare_started.elapsed().as_nanos() as u64;
+
+        let h2d_started = std::time::Instant::now();
         self.context.copy_gpu_buffer(
             self.candidate_staging.clone(),
             self.candidate_buffer.clone(),
@@ -138,7 +235,9 @@ impl GpuExactSearchContext {
         )?;
         self.context.run()?;
         self.context.wait_finish(GPU_TIMEOUT)?;
+        let h2d_ns = h2d_started.elapsed().as_nanos() as u64;
 
+        let gpu_d2h_started = std::time::Instant::now();
         self.context.bind_pipeline(
             self.pipeline.clone(),
             &[
@@ -158,13 +257,27 @@ impl GpuExactSearchContext {
         )?;
         self.context.run()?;
         self.context.wait_finish(GPU_TIMEOUT)?;
+        let gpu_d2h_ns = gpu_d2h_started.elapsed().as_nanos() as u64;
 
+        let download_started = std::time::Instant::now();
         let scores = self.score_staging.download_vec::<f32>(0, candidates.len())?;
-        let mut queue = FixedLengthPriorityQueue::new(top);
+        let download_ns = download_started.elapsed().as_nanos() as u64;
+        let cpu_topk_started = std::time::Instant::now();
+        let mut queue = TopK::new(top);
         for (&idx, score) in candidates.iter().zip(scores) {
             queue.push(ScoredPointOffset { idx, score });
         }
-        Ok(queue.into_sorted_vec())
+        let result = queue.into_vec();
+        let cpu_topk_ns = cpu_topk_started.elapsed().as_nanos() as u64;
+        self.stats.record_inner(
+            candidates.len(),
+            prepare_ns,
+            h2d_ns,
+            gpu_d2h_ns,
+            download_ns,
+            cpu_topk_ns,
+        );
+        Ok(result)
     }
 }
 
@@ -172,6 +285,7 @@ pub struct GpuExactSearchCache {
     contexts: Mutex<Vec<GpuExactSearchContext>>,
     candidate_capacity: usize,
     context_count: usize,
+    stats: Arc<GpuExactSearchStats>,
 }
 
 impl fmt::Debug for GpuExactSearchCache {
@@ -225,6 +339,7 @@ impl GpuExactSearchCache {
             .add_shader(shader)
             .build(device)?;
 
+        let stats = Arc::new(GpuExactSearchStats::default());
         let contexts = (0..context_count)
             .map(|queue_index| {
                 GpuExactSearchContext::new(
@@ -233,6 +348,7 @@ impl GpuExactSearchCache {
                     descriptor_set_layout.clone(),
                     candidate_capacity,
                     queue_index,
+                    stats.clone(),
                 )
             })
             .collect::<OperationResult<Vec<_>>>()?;
@@ -241,6 +357,7 @@ impl GpuExactSearchCache {
             contexts: Mutex::new(contexts),
             candidate_capacity,
             context_count,
+            stats,
         })
     }
 
@@ -256,6 +373,17 @@ impl GpuExactSearchCache {
         let result = context.search(query, candidates, top);
         self.contexts.lock().push(context);
         result.map(Some)
+    }
+
+    pub fn record_outer_breakdown(
+        &self,
+        predicate_ns: u64,
+        visibility_ns: u64,
+        cache_ns: u64,
+        postprocess_ns: u64,
+    ) {
+        self.stats
+            .record_outer(predicate_ns, visibility_ns, cache_ns, postprocess_ns);
     }
 }
 

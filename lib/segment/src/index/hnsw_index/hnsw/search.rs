@@ -78,6 +78,7 @@ impl HNSWIndex {
         top: usize,
         params: Option<&SearchParams>,
         vector_query_context: &VectorQueryContext,
+        predicate_ns: u64,
     ) -> OperationResult<Option<Vec<Vec<ScoredPointOffset>>>> {
         let config = get_gpu_search_config();
         if !config.enabled || !params.is_some_and(|params| params.exact) {
@@ -100,6 +101,7 @@ impl HNSWIndex {
             .deleted_points()
             .unwrap_or_else(|| id_tracker.deleted_point_bitslice());
         let deleted_vectors = vector_storage.deleted_vector_bitslice();
+        let visibility_started = std::time::Instant::now();
         let candidates = filtered_points
             .iter()
             .copied()
@@ -107,13 +109,20 @@ impl HNSWIndex {
                 check_deleted_condition(point_id, deleted_vectors, deleted_points)
             })
             .collect::<Vec<_>>();
+        let visibility_ns = visibility_started.elapsed().as_nanos() as u64;
         if candidates.len() < config.min_candidates
             || candidates.len() > config.max_candidates
         {
             return Ok(None);
         }
 
-        let Some(cache) = self.gpu_exact_search_cache(&vector_storage, &vector_query_context.is_stopped())
+        let cache_started = std::time::Instant::now();
+        let cache = self.gpu_exact_search_cache(
+            &vector_storage,
+            &vector_query_context.is_stopped(),
+        );
+        let cache_ns = cache_started.elapsed().as_nanos() as u64;
+        let Some(cache) = cache
         else {
             return Ok(None);
         };
@@ -125,6 +134,7 @@ impl HNSWIndex {
             results.push(result);
         }
 
+        let postprocess_started = std::time::Instant::now();
         let quantized_vectors = self.quantized_vectors.borrow();
         for (search_result, query_vector) in results.iter_mut().zip(query_vectors) {
             *search_result = postprocess_search_result(
@@ -138,6 +148,13 @@ impl HNSWIndex {
                 vector_query_context.hardware_counter(),
             )?;
         }
+        let postprocess_ns = postprocess_started.elapsed().as_nanos() as u64;
+        cache.record_outer_breakdown(
+            predicate_ns,
+            visibility_ns,
+            cache_ns,
+            postprocess_ns,
+        );
         Ok(Some(results))
     }
 
@@ -420,6 +437,8 @@ impl HNSWIndex {
         let hw_counter = &vector_query_context.hardware_counter();
         let is_stopped = &vector_query_context.is_stopped();
 
+        #[cfg(feature = "gpu")]
+        let predicate_started = std::time::Instant::now();
         let payload_index = self.payload_index.borrow();
         // Assume query is already estimated to be small enough so we can iterate over all matched ids
         let filtered_points: Vec<PointOffsetType> = payload_index.with_view(|v| {
@@ -435,12 +454,15 @@ impl HNSWIndex {
             .map(|it| it.collect())
         })?;
         #[cfg(feature = "gpu")]
+        let predicate_ns = predicate_started.elapsed().as_nanos() as u64;
+        #[cfg(feature = "gpu")]
         match self.search_plain_gpu_exact(
             vectors,
             &filtered_points,
             top,
             params,
             vector_query_context,
+            predicate_ns,
         ) {
             Ok(Some(results)) => return Ok(results),
             Ok(None) => {}
