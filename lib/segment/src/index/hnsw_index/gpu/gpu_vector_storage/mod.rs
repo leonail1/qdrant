@@ -868,4 +868,12 @@ impl GpuVectorStorage {
     pub fn num_vectors(&self) -> usize {
         self.num_vectors
     }
+
+    pub fn dim(&self) -> usize {
+        self.dim
+    }
+
+    pub fn vector_capacity(&self) -> usize {
+        Self::gpu_vector_capacity(&self.device, self.dim)
+    }
 }

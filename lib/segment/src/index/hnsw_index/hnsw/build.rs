@@ -593,6 +593,8 @@ impl HNSWIndex {
             graph,
             searches_telemetry: HNSWSearchesTelemetry::new(),
             is_on_disk,
+            #[cfg(feature = "gpu")]
+            gpu_exact_search: std::sync::OnceLock::new(),
         })
     }
 }

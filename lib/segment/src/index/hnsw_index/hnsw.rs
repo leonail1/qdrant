@@ -1,5 +1,7 @@
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+#[cfg(feature = "gpu")]
+use std::sync::OnceLock;
 
 use atomic_refcell::AtomicRefCell;
 use common::universal_io::MmapFs;
@@ -14,6 +16,8 @@ use crate::index::struct_payload_index::StructPayloadIndex;
 use crate::types::HnswConfig;
 use crate::vector_storage::quantized::quantized_vectors::QuantizedVectors;
 use crate::vector_storage::{VectorStorageEnum, VectorStorageRead};
+#[cfg(feature = "gpu")]
+use crate::index::hnsw_index::gpu::gpu_exact_search::GpuExactSearchCache;
 
 mod build;
 #[cfg(feature = "gpu")]
@@ -46,6 +50,8 @@ pub struct HNSWIndex {
     graph: GraphLayers,
     searches_telemetry: HNSWSearchesTelemetry,
     is_on_disk: bool,
+    #[cfg(feature = "gpu")]
+    gpu_exact_search: OnceLock<Option<Arc<GpuExactSearchCache>>>,
 }
 
 pub struct HnswIndexOpenArgs<'a> {
@@ -118,6 +124,8 @@ impl HNSWIndex {
             graph,
             searches_telemetry: HNSWSearchesTelemetry::new(),
             is_on_disk,
+            #[cfg(feature = "gpu")]
+            gpu_exact_search: OnceLock::new(),
         })
     }
 
@@ -151,6 +159,8 @@ impl HNSWIndex {
             graph,
             searches_telemetry: _,
             is_on_disk: _,
+            #[cfg(feature = "gpu")]
+            gpu_exact_search: _,
         } = self;
         graph.clear_cache()?;
         Ok(())

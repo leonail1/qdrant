@@ -22,6 +22,12 @@ pub struct Context {
     // GPU execution handler.
     vk_queue: vk::Queue,
 
+    // Stable index of the selected compute queue in `Device`.
+    compute_queue_index: usize,
+
+    // Queue family used by this context's command pool and barriers.
+    vk_queue_family_index: usize,
+
     // Command buffer is created using command pool.
     vk_command_pool: vk::CommandPool,
 
@@ -37,8 +43,18 @@ pub struct Context {
 
 impl Context {
     pub fn new(device: Arc<Device>) -> GpuResult<Self> {
+        let queue_index = device.compute_queue_index();
+        Self::new_with_queue_index(device, queue_index)
+    }
+
+    /// Create a context on a specific compute queue.
+    ///
+    /// The index wraps at the number of compute queues, which lets callers
+    /// stripe independent contexts without depending on Vulkan family details.
+    pub fn new_with_queue_index(device: Arc<Device>, queue_index: usize) -> GpuResult<Self> {
         // Get GPU execution queue from device.
-        let queue = device.compute_queue();
+        let compute_queue_index = queue_index % device.compute_queue_count();
+        let queue = device.compute_queue_at(compute_queue_index).clone();
 
         // Create command pool.
         let command_pool_create_info = vk::CommandPoolCreateInfo::default()
@@ -74,6 +90,8 @@ impl Context {
 
         let mut context = Self {
             vk_queue: queue.vk_queue,
+            compute_queue_index,
+            vk_queue_family_index: queue.vk_queue_family_index,
             device,
             vk_command_pool,
             vk_command_buffer: vk::CommandBuffer::null(),
@@ -132,12 +150,8 @@ impl Context {
                     .buffer(buffer.vk_buffer())
                     .offset(0)
                     .size(buffer.size() as vk::DeviceSize)
-                    .src_queue_family_index(
-                        self.device.compute_queue().vk_queue_family_index as u32,
-                    )
-                    .dst_queue_family_index(
-                        self.device.compute_queue().vk_queue_family_index as u32,
-                    )
+                    .src_queue_family_index(self.vk_queue_family_index as u32)
+                    .dst_queue_family_index(self.vk_queue_family_index as u32)
                     .src_access_mask(vk::AccessFlags::SHADER_WRITE)
                     .dst_access_mask(
                         vk::AccessFlags::TRANSFER_READ
@@ -316,10 +330,13 @@ impl Context {
         // Start execution of recorded commands.
         let submit_buffers = [self.vk_command_buffer];
         let submit_info = vec![vk::SubmitInfo::default().command_buffers(&submit_buffers)];
-        let submit_result = unsafe {
-            self.device
-                .vk_device()
-                .queue_submit(self.vk_queue, &submit_info, self.vk_fence)
+        let submit_result = {
+            let _queue_guard = self.device.lock_compute_queue(self.compute_queue_index);
+            unsafe {
+                self.device
+                    .vk_device()
+                    .queue_submit(self.vk_queue, &submit_info, self.vk_fence)
+            }
         };
 
         if let Err(e) = submit_result {

@@ -205,12 +205,28 @@ fn check_filesystem_compatibility(storage_path: &Path) -> bool {
 fn init_gpu_devices(settings_gpu: &crate::settings::GpuConfig) {
     use segment::index::hnsw_index::gpu::*;
 
-    if !settings_gpu.indexing {
+    if !settings_gpu.indexing && !settings_gpu.searching {
         return;
     }
 
     set_gpu_force_half_precision(settings_gpu.force_half_precision);
     set_gpu_groups_count(settings_gpu.groups_count);
+    set_gpu_search_config(
+        settings_gpu.searching,
+        settings_gpu.search_min_candidates,
+        settings_gpu.search_max_candidates,
+        settings_gpu.search_contexts,
+    );
+
+    let search_config = get_gpu_search_config();
+    if search_config.min_candidates > search_config.max_candidates {
+        log::error!(
+            "GPU search min candidates ({}) exceeds max candidates ({}); GPU search disabled",
+            search_config.min_candidates,
+            search_config.max_candidates,
+        );
+        set_gpu_search_config(false, None, None, None);
+    }
 
     let mut gpu_device_manager = GPU_DEVICES_MANAGER.write();
     *gpu_device_manager = match gpu_devices_manager::GpuDevicesMaganer::new(

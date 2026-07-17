@@ -20,8 +20,127 @@ use crate::types::{ACORN_MAX_SELECTIVITY_DEFAULT, Filter, SearchParams};
 use crate::vector_storage::quantized::quantized_vectors::QuantizedVectors;
 use crate::vector_storage::query::DiscoverQuery;
 use crate::vector_storage::{VectorStorageEnum, VectorStorageRead, new_raw_scorer};
+#[cfg(feature = "gpu")]
+use crate::index::hnsw_index::gpu::gpu_exact_search::GpuExactSearchCache;
+#[cfg(feature = "gpu")]
+use crate::index::hnsw_index::gpu::{GPU_DEVICES_MANAGER, get_gpu_search_config};
+#[cfg(feature = "gpu")]
+use crate::vector_storage::check_deleted_condition;
 
 impl HNSWIndex {
+    #[cfg(feature = "gpu")]
+    fn gpu_exact_search_cache(
+        &self,
+        vector_storage: &VectorStorageEnum,
+        is_stopped: &std::sync::atomic::AtomicBool,
+    ) -> Option<&std::sync::Arc<GpuExactSearchCache>> {
+        let config = get_gpu_search_config();
+        if !config.enabled {
+            return None;
+        }
+
+        self.gpu_exact_search
+            .get_or_init(|| {
+                let create = || -> OperationResult<Option<std::sync::Arc<GpuExactSearchCache>>> {
+                    let manager = GPU_DEVICES_MANAGER.read();
+                    let Some(manager) = manager.as_ref() else {
+                        return Ok(None);
+                    };
+                    let Some(device) = manager.lock_device(is_stopped)? else {
+                        return Ok(None);
+                    };
+                    let cache = GpuExactSearchCache::new(
+                        device.device(),
+                        vector_storage,
+                        config.max_candidates,
+                        config.contexts,
+                        is_stopped,
+                    )?;
+                    Ok(Some(std::sync::Arc::new(cache)))
+                };
+
+                match create() {
+                    Ok(cache) => cache,
+                    Err(error) => {
+                        log::warn!("Failed to initialize GPU exact search cache: {error}");
+                        None
+                    }
+                }
+            })
+            .as_ref()
+    }
+
+    #[cfg(feature = "gpu")]
+    fn search_plain_gpu_exact(
+        &self,
+        query_vectors: &[&QueryVector],
+        filtered_points: &[PointOffsetType],
+        top: usize,
+        params: Option<&SearchParams>,
+        vector_query_context: &VectorQueryContext,
+    ) -> OperationResult<Option<Vec<Vec<ScoredPointOffset>>>> {
+        let config = get_gpu_search_config();
+        if !config.enabled || !params.is_some_and(|params| params.exact) {
+            return Ok(None);
+        }
+        let dense_queries = query_vectors
+            .iter()
+            .map(|query| match query {
+                QueryVector::Nearest(VectorInternal::Dense(vector)) => Some(vector.as_slice()),
+                _ => None,
+            })
+            .collect::<Option<Vec<_>>>();
+        let Some(dense_queries) = dense_queries else {
+            return Ok(None);
+        };
+
+        let id_tracker = self.id_tracker.borrow();
+        let vector_storage = self.vector_storage.borrow();
+        let deleted_points = vector_query_context
+            .deleted_points()
+            .unwrap_or_else(|| id_tracker.deleted_point_bitslice());
+        let deleted_vectors = vector_storage.deleted_vector_bitslice();
+        let candidates = filtered_points
+            .iter()
+            .copied()
+            .filter(|&point_id| {
+                check_deleted_condition(point_id, deleted_vectors, deleted_points)
+            })
+            .collect::<Vec<_>>();
+        if candidates.len() < config.min_candidates
+            || candidates.len() > config.max_candidates
+        {
+            return Ok(None);
+        }
+
+        let Some(cache) = self.gpu_exact_search_cache(&vector_storage, &vector_query_context.is_stopped())
+        else {
+            return Ok(None);
+        };
+        let mut results = Vec::with_capacity(dense_queries.len());
+        for query in dense_queries {
+            let Some(result) = cache.search(query, &candidates, top)? else {
+                return Ok(None);
+            };
+            results.push(result);
+        }
+
+        let quantized_vectors = self.quantized_vectors.borrow();
+        for (search_result, query_vector) in results.iter_mut().zip(query_vectors) {
+            *search_result = postprocess_search_result(
+                std::mem::take(search_result),
+                id_tracker.deleted_point_bitslice(),
+                &vector_storage,
+                quantized_vectors.as_ref(),
+                query_vector,
+                params,
+                top,
+                vector_query_context.hardware_counter(),
+            )?;
+        }
+        Ok(Some(results))
+    }
+
     pub(super) fn search_with_graph(
         &self,
         vector: &QueryVector,
@@ -315,6 +434,21 @@ impl HNSWIndex {
             )
             .map(|it| it.collect())
         })?;
+        #[cfg(feature = "gpu")]
+        match self.search_plain_gpu_exact(
+            vectors,
+            &filtered_points,
+            top,
+            params,
+            vector_query_context,
+        ) {
+            Ok(Some(results)) => return Ok(results),
+            Ok(None) => {}
+            Err(error) => {
+                log::warn!("GPU exact filtered search failed; falling back to CPU: {error}");
+            }
+        }
+
         self.search_plain_batched(
             vectors,
             filtered_points.into_iter(),

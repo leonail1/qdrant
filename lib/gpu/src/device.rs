@@ -27,6 +27,10 @@ pub struct Device {
     /// All found compute queues.
     compute_queues: Vec<Queue>,
 
+    /// Vulkan queues require external synchronization for host queue operations.
+    /// Keep one shared lock per queue so independent contexts can submit safely.
+    compute_queue_locks: Vec<Mutex<()>>,
+
     /// All found transfer queues.
     _transfer_queues: Vec<Queue>,
 
@@ -297,11 +301,16 @@ impl Device {
             }
         };
 
+        let compute_queue_locks = (0..compute_queues.len())
+            .map(|_| Mutex::new(()))
+            .collect();
+
         Ok(Arc::new(Device {
             instance: instance.clone(),
             vk_device,
             gpu_allocator,
             compute_queues,
+            compute_queue_locks,
             _transfer_queues: transfer_queues,
             subgroup_size,
             max_compute_work_group_count,
@@ -375,7 +384,27 @@ impl Device {
     }
 
     pub fn compute_queue(&self) -> &Queue {
-        &self.compute_queues[self.queue_index % self.compute_queues.len()]
+        self.compute_queue_at(self.compute_queue_index())
+    }
+
+    /// Index selected for contexts that do not explicitly choose a queue.
+    pub fn compute_queue_index(&self) -> usize {
+        self.queue_index % self.compute_queues.len()
+    }
+
+    /// Number of compute-capable queues exposed by this logical device.
+    pub fn compute_queue_count(&self) -> usize {
+        self.compute_queues.len()
+    }
+
+    /// Select a compute queue by a stable, wrapping index.
+    pub fn compute_queue_at(&self, index: usize) -> &Queue {
+        &self.compute_queues[index % self.compute_queues.len()]
+    }
+
+    /// Serialize host submissions to one Vulkan queue as required by the spec.
+    pub fn lock_compute_queue(&self, index: usize) -> parking_lot::MutexGuard<'_, ()> {
+        self.compute_queue_locks[index % self.compute_queue_locks.len()].lock()
     }
 
     pub fn name(&self) -> &str {

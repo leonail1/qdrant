@@ -1,5 +1,6 @@
 pub mod batched_points;
 pub mod gpu_devices_manager;
+pub mod gpu_exact_search;
 pub mod gpu_graph_builder;
 pub mod gpu_insert_context;
 pub mod gpu_level_builder;
@@ -36,12 +37,52 @@ pub const GPU_GROUPS_COUNT_DEFAULT: usize = 512;
 /// Global option from settings to force half precision on GPU for `f32` values.
 static GPU_FORCE_HALF_PRECISION: AtomicBool = AtomicBool::new(false);
 
+static GPU_SEARCHING: AtomicBool = AtomicBool::new(false);
+static GPU_SEARCH_MIN_CANDIDATES: AtomicUsize = AtomicUsize::new(4_096);
+static GPU_SEARCH_MAX_CANDIDATES: AtomicUsize = AtomicUsize::new(200_000);
+static GPU_SEARCH_CONTEXTS: AtomicUsize = AtomicUsize::new(8);
+
+#[derive(Clone, Copy, Debug)]
+pub struct GpuSearchConfig {
+    pub enabled: bool,
+    pub min_candidates: usize,
+    pub max_candidates: usize,
+    pub contexts: usize,
+}
+
 pub fn set_gpu_force_half_precision(force_half_precision: bool) {
     GPU_FORCE_HALF_PRECISION.store(force_half_precision, Ordering::Relaxed);
 }
 
 pub fn get_gpu_force_half_precision() -> bool {
     GPU_FORCE_HALF_PRECISION.load(Ordering::Relaxed)
+}
+
+pub fn set_gpu_search_config(
+    enabled: bool,
+    min_candidates: Option<usize>,
+    max_candidates: Option<usize>,
+    contexts: Option<usize>,
+) {
+    GPU_SEARCHING.store(enabled, Ordering::Relaxed);
+    if let Some(value) = min_candidates {
+        GPU_SEARCH_MIN_CANDIDATES.store(value, Ordering::Relaxed);
+    }
+    if let Some(value) = max_candidates {
+        GPU_SEARCH_MAX_CANDIDATES.store(value, Ordering::Relaxed);
+    }
+    if let Some(value) = contexts {
+        GPU_SEARCH_CONTEXTS.store(value, Ordering::Relaxed);
+    }
+}
+
+pub fn get_gpu_search_config() -> GpuSearchConfig {
+    GpuSearchConfig {
+        enabled: GPU_SEARCHING.load(Ordering::Relaxed),
+        min_candidates: GPU_SEARCH_MIN_CANDIDATES.load(Ordering::Relaxed),
+        max_candidates: GPU_SEARCH_MAX_CANDIDATES.load(Ordering::Relaxed),
+        contexts: GPU_SEARCH_CONTEXTS.load(Ordering::Relaxed),
+    }
 }
 
 pub fn set_gpu_groups_count(groups_count: Option<usize>) {

@@ -200,6 +200,21 @@ pub struct GpuConfig {
     /// Enable GPU indexing.
     #[serde(default)]
     pub indexing: bool,
+    /// Enable exact filtered search over database-owned, GPU-resident indexed segments.
+    #[serde(default)]
+    pub searching: bool,
+    /// Minimum predicate candidates per segment before GPU exact search is considered.
+    #[serde(default)]
+    #[validate(range(min = 1))]
+    pub search_min_candidates: Option<usize>,
+    /// Maximum predicate candidates per segment accepted by a GPU search context.
+    #[serde(default)]
+    #[validate(range(min = 1))]
+    pub search_max_candidates: Option<usize>,
+    /// Number of non-blocking GPU search contexts allocated per indexed segment.
+    #[serde(default)]
+    #[validate(range(min = 1))]
+    pub search_contexts: Option<usize>,
     /// Force half precision for `f32` values while indexing.
     /// `f16` conversion will take place only inside GPU memory and won't affect storage type.
     #[serde(default)]
