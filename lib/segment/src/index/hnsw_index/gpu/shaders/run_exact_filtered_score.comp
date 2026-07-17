@@ -5,6 +5,8 @@
 
 layout(local_size_x = SUBGROUP_SIZE, local_size_y = 1, local_size_z = 1) in;
 
+#define PARTIAL_TOP_K 16
+
 #define VECTOR_STORAGE_LAYOUT_SET 1
 #include "vector_storage.comp"
 
@@ -16,9 +18,17 @@ layout(set = 0, binding = 1) readonly buffer QueryVector {
     vec4 data[];
 } query_vector;
 
-layout(set = 0, binding = 2) writeonly buffer CandidateScores {
-    float data[];
-} candidate_scores;
+layout(set = 0, binding = 2) writeonly buffer PartialTopK {
+    uint data[];
+} partial_top_k;
+
+shared float partition_scores[PARTIAL_TOP_K];
+shared uint partition_ids[PARTIAL_TOP_K];
+
+bool is_better(float left_score, uint left_id, float right_score, uint right_id) {
+    return left_score > right_score ||
+        (left_score == right_score && left_id < right_id);
+}
 
 void load_query_target() {
 #ifdef SINGLE_SUBGROUP_PER_VECTOR
@@ -31,10 +41,53 @@ void load_query_target() {
 }
 
 void main() {
-    uint candidate_index = SUBGROUP_ID;
     load_query_target();
-    float score = similarity(candidate_ids.data[candidate_index]);
-    if (subgroupElect()) {
-        candidate_scores.data[candidate_index] = score;
+
+    if (gl_SubgroupInvocationID == 0) {
+        for (uint i = 0; i < PARTIAL_TOP_K; i++) {
+            partition_scores[i] = negative_infinity;
+            partition_ids[i] = INVALID_POINT_ID;
+        }
+    }
+
+    uint candidate_count = candidate_ids.data[0];
+    for (
+        uint candidate_index = gl_WorkGroupID.x;
+        candidate_index < candidate_count;
+        candidate_index += gl_NumWorkGroups.x
+    ) {
+        uint point_id = candidate_ids.data[candidate_index + 1];
+        float score = similarity(point_id);
+
+        if (gl_SubgroupInvocationID == 0 &&
+            is_better(
+                score,
+                point_id,
+                partition_scores[PARTIAL_TOP_K - 1],
+                partition_ids[PARTIAL_TOP_K - 1]
+            )) {
+            uint insertion = PARTIAL_TOP_K - 1;
+            while (insertion > 0 &&
+                is_better(
+                    score,
+                    point_id,
+                    partition_scores[insertion - 1],
+                    partition_ids[insertion - 1]
+                )) {
+                partition_scores[insertion] = partition_scores[insertion - 1];
+                partition_ids[insertion] = partition_ids[insertion - 1];
+                insertion--;
+            }
+            partition_scores[insertion] = score;
+            partition_ids[insertion] = point_id;
+        }
+    }
+
+    if (gl_SubgroupInvocationID == 0) {
+        uint output_offset = gl_WorkGroupID.x * PARTIAL_TOP_K * 2;
+        for (uint i = 0; i < PARTIAL_TOP_K; i++) {
+            partial_top_k.data[output_offset + i * 2] = partition_ids[i];
+            partial_top_k.data[output_offset + i * 2 + 1] = floatBitsToUint(partition_scores[i]);
+        }
     }
 }

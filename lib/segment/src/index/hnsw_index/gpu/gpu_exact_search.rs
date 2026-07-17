@@ -11,6 +11,10 @@ use super::shader_builder::ShaderBuilder;
 use crate::common::operation_error::{OperationError, OperationResult};
 use crate::vector_storage::VectorStorageRead;
 
+const PARTIAL_TOP_K: usize = 16;
+const MAX_PARTITIONS: usize = 512;
+const PARTIAL_RESULT_WORDS: usize = 2;
+
 struct GpuExactSearchContext {
     context: gpu::Context,
     pipeline: Arc<gpu::Pipeline>,
@@ -20,8 +24,8 @@ struct GpuExactSearchContext {
     candidate_staging: Arc<gpu::Buffer>,
     query_buffer: Arc<gpu::Buffer>,
     query_staging: Arc<gpu::Buffer>,
-    score_buffer: Arc<gpu::Buffer>,
-    score_staging: Arc<gpu::Buffer>,
+    result_buffer: Arc<gpu::Buffer>,
+    result_staging: Arc<gpu::Buffer>,
     candidate_capacity: usize,
     query_capacity: usize,
 }
@@ -35,8 +39,11 @@ impl GpuExactSearchContext {
         queue_index: usize,
     ) -> OperationResult<Self> {
         let device = vector_storage.device();
-        let candidate_bytes = candidate_capacity * std::mem::size_of::<PointOffsetType>();
-        let score_bytes = candidate_capacity * std::mem::size_of::<f32>();
+        let candidate_bytes = (candidate_capacity + 1) * std::mem::size_of::<PointOffsetType>();
+        let result_bytes = MAX_PARTITIONS
+            * PARTIAL_TOP_K
+            * PARTIAL_RESULT_WORDS
+            * std::mem::size_of::<u32>();
         let query_capacity = vector_storage.vector_capacity();
         let query_bytes = query_capacity * std::mem::size_of::<f32>();
 
@@ -64,22 +71,22 @@ impl GpuExactSearchContext {
             gpu::BufferType::CpuToGpu,
             query_bytes,
         )?;
-        let score_buffer = gpu::Buffer::new(
+        let result_buffer = gpu::Buffer::new(
             device.clone(),
-            "Exact filtered candidate scores",
+            "Exact filtered partial top-k",
             gpu::BufferType::Storage,
-            score_bytes,
+            result_bytes,
         )?;
-        let score_staging = gpu::Buffer::new(
+        let result_staging = gpu::Buffer::new(
             device.clone(),
-            "Exact filtered score download",
+            "Exact filtered partial top-k download",
             gpu::BufferType::GpuToCpu,
-            score_bytes,
+            result_bytes,
         )?;
         let descriptor_set = gpu::DescriptorSet::builder(descriptor_set_layout)
             .add_storage_buffer(0, candidate_buffer.clone())
             .add_storage_buffer(1, query_buffer.clone())
-            .add_storage_buffer(2, score_buffer.clone())
+            .add_storage_buffer(2, result_buffer.clone())
             .build()?;
 
         Ok(Self {
@@ -91,8 +98,8 @@ impl GpuExactSearchContext {
             candidate_staging,
             query_buffer,
             query_staging,
-            score_buffer,
-            score_staging,
+            result_buffer,
+            result_staging,
             candidate_capacity,
             query_capacity,
         })
@@ -117,17 +124,27 @@ impl GpuExactSearchContext {
         if candidates.is_empty() || top == 0 {
             return Ok(Vec::new());
         }
+        if top > PARTIAL_TOP_K {
+            return Err(OperationError::service_error(
+                "GPU exact top-k exceeds partial reduction capacity",
+            ));
+        }
 
         let mut padded_query = vec![0.0f32; self.query_capacity];
         padded_query[..query.len()].copy_from_slice(query);
-        self.candidate_staging.upload(candidates, 0)?;
+        let candidate_count = candidates.len() as PointOffsetType;
+        self.candidate_staging.upload(&candidate_count, 0)?;
+        self.candidate_staging.upload(
+            candidates,
+            std::mem::size_of::<PointOffsetType>(),
+        )?;
         self.query_staging.upload(padded_query.as_slice(), 0)?;
         self.context.copy_gpu_buffer(
             self.candidate_staging.clone(),
             self.candidate_buffer.clone(),
             0,
             0,
-            std::mem::size_of_val(candidates),
+            (candidates.len() + 1) * std::mem::size_of::<PointOffsetType>(),
         )?;
         self.context.copy_gpu_buffer(
             self.query_staging.clone(),
@@ -146,23 +163,37 @@ impl GpuExactSearchContext {
                 self.vector_storage.descriptor_set(),
             ],
         )?;
-        self.context.dispatch(candidates.len(), 1, 1)?;
+        let partitions = std::cmp::min(
+            MAX_PARTITIONS,
+            candidates.len().div_ceil(PARTIAL_TOP_K),
+        );
+        let partial_result_count = partitions * PARTIAL_TOP_K;
+        self.context.dispatch(partitions, 1, 1)?;
         self.context
-            .barrier_buffers(std::slice::from_ref(&self.score_buffer))?;
+            .barrier_buffers(std::slice::from_ref(&self.result_buffer))?;
         self.context.copy_gpu_buffer(
-            self.score_buffer.clone(),
-            self.score_staging.clone(),
+            self.result_buffer.clone(),
+            self.result_staging.clone(),
             0,
             0,
-            candidates.len() * std::mem::size_of::<f32>(),
+            partial_result_count * PARTIAL_RESULT_WORDS * std::mem::size_of::<u32>(),
         )?;
         self.context.run()?;
         self.context.wait_finish(GPU_TIMEOUT)?;
 
-        let scores = self.score_staging.download_vec::<f32>(0, candidates.len())?;
+        let partial_results = self
+            .result_staging
+            .download_vec::<u32>(0, partial_result_count * PARTIAL_RESULT_WORDS)?;
         let mut queue = FixedLengthPriorityQueue::new(top);
-        for (&idx, score) in candidates.iter().zip(scores) {
-            queue.push(ScoredPointOffset { idx, score });
+        for result in partial_results.chunks_exact(PARTIAL_RESULT_WORDS) {
+            let idx = result[0];
+            if idx == PointOffsetType::MAX {
+                continue;
+            }
+            queue.push(ScoredPointOffset {
+                idx,
+                score: f32::from_bits(result[1]),
+            });
         }
         Ok(queue.into_sorted_vec())
     }
@@ -250,6 +281,9 @@ impl GpuExactSearchCache {
         candidates: &[PointOffsetType],
         top: usize,
     ) -> OperationResult<Option<Vec<ScoredPointOffset>>> {
+        if top > PARTIAL_TOP_K {
+            return Ok(None);
+        }
         let Some(mut context) = self.contexts.lock().pop() else {
             return Ok(None);
         };
@@ -273,7 +307,7 @@ mod tests {
     #[test]
     fn exact_filtered_gpu_matches_cpu_l2() {
         const DIM: usize = 128;
-        const COUNT: usize = 1_024;
+        const COUNT: usize = 32_768;
         const TARGET: usize = 137;
         const TOP: usize = 10;
 
