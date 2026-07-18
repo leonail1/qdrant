@@ -517,8 +517,11 @@ impl HNSWIndex {
         #[cfg(feature = "gpu")]
         let (filtered_points, predicate_ns, filter_cache_hit) = {
             let predicate_started = std::time::Instant::now();
+            // The predicate projection belongs to the database execution
+            // layer, not to the GPU exact kernel. Reuse it for stock-compatible
+            // CPU plain scoring as well, so a GPU miss or cost-model fallback
+            // does not re-run the payload iterator on every query.
             let cacheable = get_gpu_search_config().enabled
-                && params.is_some_and(|params| params.exact)
                 && !payload_index.is_appendable()
                 && gpu_filter_cacheable(filter);
             let payload_epoch = payload_index.mutation_epoch();

@@ -29,13 +29,20 @@ use crate::vector_storage::VectorStorageRead;
 fn gpu_router_should_use_plain(
     config: GpuSearchConfig,
     cardinality_upper_bound: usize,
+    stock_graph_is_certain: bool,
     appendable: bool,
     cacheable_filter: bool,
     supported_query: bool,
 ) -> bool {
     config.enabled
         && config.router_enabled
+        && cardinality_upper_bound >= config.min_candidates
         && cardinality_upper_bound <= config.max_candidates
+        // Do not replace Qdrant's predicate-first plain path. It can retain
+        // quantized scoring, while the GPU exact fallback intentionally uses
+        // float32. The GPU router is only allowed to compete with a graph
+        // route that stock Qdrant would certainly select.
+        && stock_graph_is_certain
         && !appendable
         && cacheable_filter
         && supported_query
@@ -148,6 +155,7 @@ impl VectorIndexRead for HNSWIndex {
                     if gpu_router_should_use_plain(
                         get_gpu_search_config(),
                         query_cardinality.max,
+                        query_cardinality.min > self.config.full_scan_threshold,
                         payload_index.is_appendable(),
                         gpu_filter_cacheable(query_filter),
                         supported_query,
@@ -284,13 +292,31 @@ mod gpu_router_tests {
         assert!(gpu_router_should_use_plain(
             config(true),
             100_000,
+            true,
+            false,
+            true,
+            true,
+        ));
+        assert!(!gpu_router_should_use_plain(
+            config(true),
+            1_000,
+            false,
+            false,
+            true,
+            true,
+        ));
+        assert!(!gpu_router_should_use_plain(
+            config(true),
+            4_096,
+            false,
             false,
             true,
             true,
         ));
         assert!(gpu_router_should_use_plain(
             config(true),
-            1_000,
+            4_096,
+            true,
             false,
             true,
             true,
@@ -298,6 +324,7 @@ mod gpu_router_tests {
         assert!(!gpu_router_should_use_plain(
             config(false),
             100_000,
+            true,
             false,
             true,
             true,
@@ -305,6 +332,7 @@ mod gpu_router_tests {
         assert!(!gpu_router_should_use_plain(
             config(true),
             200_001,
+            true,
             false,
             true,
             true,
@@ -315,10 +343,12 @@ mod gpu_router_tests {
             true,
             true,
             true,
+            true,
         ));
         assert!(!gpu_router_should_use_plain(
             config(true),
             100_000,
+            true,
             false,
             false,
             true,
@@ -326,6 +356,7 @@ mod gpu_router_tests {
         assert!(!gpu_router_should_use_plain(
             config(true),
             100_000,
+            true,
             false,
             true,
             false,
