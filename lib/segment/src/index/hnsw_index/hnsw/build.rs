@@ -596,6 +596,8 @@ impl HNSWIndex {
             #[cfg(feature = "gpu")]
             gpu_exact_search: std::sync::OnceLock::new(),
             #[cfg(feature = "gpu")]
+            gpu_filtered_graph_search: std::sync::OnceLock::new(),
+            #[cfg(feature = "gpu")]
             gpu_filter_candidates: parking_lot::Mutex::new(
                 crate::index::hnsw_index::gpu::gpu_exact_search::GpuFilterCandidateCache::default(),
             ),

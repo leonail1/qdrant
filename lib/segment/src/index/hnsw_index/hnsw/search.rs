@@ -39,11 +39,76 @@ use crate::index::hnsw_index::gpu::gpu_exact_search::{
     GPU_EXACT_SUBMISSION_BATCH_LIMIT, GpuExactSearchCache, GpuVisibilitySnapshot,
 };
 #[cfg(feature = "gpu")]
-use crate::index::hnsw_index::gpu::{GPU_DEVICES_MANAGER, get_gpu_search_config};
+use crate::index::hnsw_index::gpu::gpu_filtered_graph_search::GpuFilteredGraphSearchCache;
+#[cfg(feature = "gpu")]
+use crate::index::hnsw_index::gpu::gpu_vector_storage::GpuVectorStorage;
+#[cfg(feature = "gpu")]
+use crate::index::hnsw_index::gpu::{
+    GPU_DEVICES_MANAGER, GPU_FILTERED_GRAPH_MIN_CANDIDATES, get_gpu_search_config,
+};
 #[cfg(feature = "gpu")]
 use crate::vector_storage::check_deleted_condition;
 
 impl HNSWIndex {
+    #[cfg(feature = "gpu")]
+    fn gpu_filtered_graph_search_cache(
+        &self,
+        vector_storage: &VectorStorageEnum,
+        ef: usize,
+        is_stopped: &std::sync::atomic::AtomicBool,
+    ) -> Option<&std::sync::Arc<GpuFilteredGraphSearchCache>> {
+        let config = get_gpu_search_config();
+        if !config.enabled || !config.router_enabled {
+            return None;
+        }
+
+        self.gpu_filtered_graph_search
+            .get_or_init(|| {
+                let create =
+                    || -> OperationResult<Option<std::sync::Arc<GpuFilteredGraphSearchCache>>> {
+                        let manager = GPU_DEVICES_MANAGER.read();
+                        let Some(manager) = manager.as_ref() else {
+                            return Ok(None);
+                        };
+                        let Some(device) = manager.lock_device(is_stopped)? else {
+                            return Ok(None);
+                        };
+                        let gpu_vectors = std::sync::Arc::new(GpuVectorStorage::new(
+                            device.device(),
+                            vector_storage,
+                            None,
+                            false,
+                            is_stopped,
+                        )?);
+                        let cache = GpuFilteredGraphSearchCache::new(
+                            device.device(),
+                            gpu_vectors,
+                            &self.graph,
+                            vector_storage.total_vector_count(),
+                            ef,
+                            config.contexts,
+                            is_stopped,
+                        )?;
+                        log::info!(
+                            "Initialized GPU filtered graph search: points={}, ef={}, contexts={}",
+                            vector_storage.total_vector_count(),
+                            ef,
+                            config.contexts,
+                        );
+                        Ok(Some(std::sync::Arc::new(cache)))
+                    };
+
+                match create() {
+                    Ok(cache) => cache,
+                    Err(error) => {
+                        log::warn!("Failed to initialize GPU filtered graph cache: {error}");
+                        None
+                    }
+                }
+            })
+            .as_ref()
+    }
+
     #[cfg(feature = "gpu")]
     fn gpu_exact_search_cache(
         &self,
@@ -292,6 +357,118 @@ impl HNSWIndex {
             };
             if selectivity <= acorn_max_selectivity {
                 algorithm = SearchAlgorithm::Acorn;
+            }
+        }
+
+        #[cfg(feature = "gpu")]
+        if algorithm == SearchAlgorithm::Hnsw
+            && custom_entry_points.is_none()
+            && let Some(filter) = filter
+            && let QueryVector::Nearest(VectorInternal::Dense(query)) = vector
+        {
+            let config = get_gpu_search_config();
+            let query_point_cardinality =
+                payload_index.with_view(|v| v.estimate_cardinality(filter, &hw_counter))?;
+            let query_cardinality = adjust_to_available_vectors(
+                query_point_cardinality,
+                vector_storage.available_vector_count(),
+                id_tracker.available_point_count(),
+            );
+            let cacheable = config.enabled
+                && config.router_enabled
+                && query_cardinality.max >= GPU_FILTERED_GRAPH_MIN_CANDIDATES
+                && query_cardinality.max <= config.max_candidates
+                && !payload_index.is_appendable()
+                && gpu_filter_cacheable(filter);
+            let visibility_snapshot = vector_query_context
+                .deleted_points()
+                .zip(vector_query_context.deleted_points_generation())
+                .filter(|(deleted, generation)| {
+                    *generation != 0 && deleted.len() <= vector_storage.total_vector_count()
+                })
+                .map(|(deleted, generation)| GpuVisibilitySnapshot {
+                    generation,
+                    deleted,
+                    point_count: vector_storage.total_vector_count(),
+                });
+            let static_deletions =
+                id_tracker.deleted_point_count() != 0 || vector_storage.deleted_vector_count() != 0;
+            if cacheable && (!static_deletions || visibility_snapshot.is_some()) {
+                let payload_epoch = payload_index.mutation_epoch();
+                let cached = self.gpu_filter_candidates.lock().get(filter, payload_epoch);
+                let candidates = if let Some(candidates) = cached {
+                    candidates
+                } else {
+                    let candidates = Arc::new(payload_index.with_view(|view| {
+                        view.iter_filtered_points(
+                            filter,
+                            &query_cardinality,
+                            &hw_counter,
+                            &is_stopped,
+                            DeferredBehavior::IncludeAll,
+                        )
+                        .map(|points| points.collect::<Vec<_>>())
+                    })?);
+                    self.gpu_filter_candidates.lock().insert(
+                        filter.clone(),
+                        candidates.clone(),
+                        payload_epoch,
+                    );
+                    candidates
+                };
+                let gpu_search = payload_index.with_view(|payload_index_view| {
+                    let filter_context = payload_index_view.filter_context(filter, &hw_counter)?;
+                    let mut points_scorer = construct_search_scorer(
+                        vector,
+                        &vector_storage,
+                        quantized_vectors.as_ref(),
+                        deleted_points,
+                        params,
+                        vector_query_context.hardware_counter(),
+                        Some(filter_context),
+                    )?;
+                    let Some(entry) = self.graph.search_level_zero_entry(
+                        &mut points_scorer,
+                        None,
+                        &is_stopped,
+                    )?
+                    else {
+                        return Ok(Some(Vec::new()));
+                    };
+                    let Some(cache) =
+                        self.gpu_filtered_graph_search_cache(&vector_storage, ef, &is_stopped)
+                    else {
+                        return Ok(None);
+                    };
+                    cache.search(
+                        query,
+                        entry.idx,
+                        candidates,
+                        visibility_snapshot,
+                        oversampled_top,
+                        ef,
+                    )
+                });
+                match gpu_search {
+                    Ok(Some(search_result)) => {
+                        return postprocess_search_result(
+                            search_result,
+                            id_tracker.deleted_point_bitslice(),
+                            &vector_storage,
+                            quantized_vectors.as_ref(),
+                            vector,
+                            params,
+                            top,
+                            vector_query_context.hardware_counter(),
+                        );
+                    }
+                    Ok(None) => {}
+                    Err(error) => {
+                        log::warn!(
+                            "GPU filtered graph search failed; falling back to CPU: {error}"
+                        );
+                    }
+                }
             }
         }
 

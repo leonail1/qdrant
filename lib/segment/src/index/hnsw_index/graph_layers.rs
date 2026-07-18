@@ -528,6 +528,30 @@ impl GraphLayers {
             })
     }
 
+    /// Resolve the filtered entry point and greedily descend to level zero.
+    ///
+    /// This is split from [`Self::search`] so alternate level-zero executors
+    /// can preserve Qdrant's existing entry selection and upper-layer walk.
+    pub(crate) fn search_level_zero_entry(
+        &self,
+        points_scorer: &mut FilteredScorer,
+        custom_entry_points: Option<&[PointOffsetType]>,
+        is_stopped: &AtomicBool,
+    ) -> CancellableResult<Option<ScoredPointOffset>> {
+        let Some(entry_point) = self.get_entry_point(points_scorer.filters(), custom_entry_points)
+        else {
+            return Ok(None);
+        };
+        self.search_entry(
+            entry_point.point_id,
+            entry_point.level,
+            0,
+            points_scorer,
+            is_stopped,
+        )
+        .map(Some)
+    }
+
     pub fn search(
         &self,
         top: usize,
@@ -537,18 +561,11 @@ impl GraphLayers {
         custom_entry_points: Option<&[PointOffsetType]>,
         is_stopped: &AtomicBool,
     ) -> CancellableResult<Vec<ScoredPointOffset>> {
-        let Some(entry_point) = self.get_entry_point(points_scorer.filters(), custom_entry_points)
+        let Some(zero_level_entry) =
+            self.search_level_zero_entry(&mut points_scorer, custom_entry_points, is_stopped)?
         else {
             return Ok(Vec::default());
         };
-
-        let zero_level_entry = self.search_entry(
-            entry_point.point_id,
-            entry_point.level,
-            0,
-            &mut points_scorer,
-            is_stopped,
-        )?;
         let ef = max(ef, top);
         let nearest = match algorithm {
             SearchAlgorithm::Hnsw => {

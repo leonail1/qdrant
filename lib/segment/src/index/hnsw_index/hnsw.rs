@@ -17,6 +17,8 @@ use crate::index::hnsw_index::config::HnswGraphConfig;
 use crate::index::hnsw_index::gpu::gpu_exact_search::{
     GpuExactSearchCache, GpuFilterCandidateCache,
 };
+#[cfg(feature = "gpu")]
+use crate::index::hnsw_index::gpu::gpu_filtered_graph_search::GpuFilteredGraphSearchCache;
 use crate::index::hnsw_index::graph_layers::{GraphLayers, LoadOption};
 use crate::index::struct_payload_index::StructPayloadIndex;
 use crate::types::HnswConfig;
@@ -56,6 +58,8 @@ pub struct HNSWIndex {
     is_on_disk: bool,
     #[cfg(feature = "gpu")]
     gpu_exact_search: OnceLock<Option<Arc<GpuExactSearchCache>>>,
+    #[cfg(feature = "gpu")]
+    gpu_filtered_graph_search: OnceLock<Option<Arc<GpuFilteredGraphSearchCache>>>,
     #[cfg(feature = "gpu")]
     gpu_filter_candidates: Mutex<GpuFilterCandidateCache>,
 }
@@ -133,6 +137,8 @@ impl HNSWIndex {
             #[cfg(feature = "gpu")]
             gpu_exact_search: OnceLock::new(),
             #[cfg(feature = "gpu")]
+            gpu_filtered_graph_search: OnceLock::new(),
+            #[cfg(feature = "gpu")]
             gpu_filter_candidates: Mutex::new(GpuFilterCandidateCache::default()),
         })
     }
@@ -170,6 +176,8 @@ impl HNSWIndex {
             #[cfg(feature = "gpu")]
             gpu_exact_search,
             #[cfg(feature = "gpu")]
+            gpu_filtered_graph_search,
+            #[cfg(feature = "gpu")]
             gpu_filter_candidates,
         } = self;
         graph.clear_cache()?;
@@ -178,6 +186,9 @@ impl HNSWIndex {
             gpu_filter_candidates.lock().clear();
             if let Some(Some(cache)) = gpu_exact_search.get() {
                 cache.clear_resident_candidates();
+            }
+            if let Some(Some(cache)) = gpu_filtered_graph_search.get() {
+                cache.clear_resident_filters();
             }
         }
         Ok(())

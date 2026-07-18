@@ -34,6 +34,9 @@ static GPU_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
 /// In other words, how many parallel points can be indexed by GPU.
 static GPU_GROUPS_COUNT: AtomicUsize = AtomicUsize::new(GPU_GROUPS_COUNT_DEFAULT);
 pub const GPU_GROUPS_COUNT_DEFAULT: usize = 512;
+/// Initial crossover guard between GPU exact predicate scoring and filtered
+/// graph traversal. A measured cost model can replace this static floor.
+pub const GPU_FILTERED_GRAPH_MIN_CANDIDATES: usize = 32_768;
 
 /// Global option from settings to force half precision on GPU for `f32` values.
 static GPU_FORCE_HALF_PRECISION: AtomicBool = AtomicBool::new(false);

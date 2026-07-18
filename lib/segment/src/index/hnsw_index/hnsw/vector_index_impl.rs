@@ -17,7 +17,9 @@ use crate::data_types::vectors::{QueryVector, VectorRef};
 use crate::id_tracker::IdTrackerRead;
 use crate::index::hnsw_index::config::HnswGraphConfig;
 #[cfg(feature = "gpu")]
-use crate::index::hnsw_index::gpu::{GpuSearchConfig, get_gpu_search_config};
+use crate::index::hnsw_index::gpu::{
+    GPU_FILTERED_GRAPH_MIN_CANDIDATES, GpuSearchConfig, get_gpu_search_config,
+};
 use crate::index::query_estimator::adjust_to_available_vectors;
 use crate::index::sample_estimation::sample_check_cardinality;
 use crate::index::{PayloadIndexRead, VectorIndex, VectorIndexRead};
@@ -38,6 +40,7 @@ fn gpu_router_should_use_plain(
         && config.router_enabled
         && cardinality_upper_bound >= config.min_candidates
         && cardinality_upper_bound <= config.max_candidates
+        && cardinality_upper_bound < GPU_FILTERED_GRAPH_MIN_CANDIDATES
         // Do not replace Qdrant's predicate-first plain path. It can retain
         // quantized scoring, while the GPU exact fallback intentionally uses
         // float32. The GPU router is only allowed to compete with a graph
