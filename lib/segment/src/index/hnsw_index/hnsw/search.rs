@@ -34,6 +34,48 @@ pub(super) fn gpu_filter_cacheable(filter: &Filter) -> bool {
         Condition::HasId(_) | Condition::HasVector(_) | Condition::CustomIdChecker(_) => false,
     })
 }
+
+#[cfg(feature = "gpu")]
+const GPU_HALF_PRECISION_RERANK_LIMIT: usize = 16;
+
+#[cfg(feature = "gpu")]
+fn gpu_half_precision_search_top(top: usize) -> usize {
+    if !get_gpu_force_half_precision() || top >= GPU_HALF_PRECISION_RERANK_LIMIT {
+        return top;
+    }
+    top.saturating_add(top.div_ceil(2))
+        .min(GPU_HALF_PRECISION_RERANK_LIMIT)
+}
+
+#[cfg(feature = "gpu")]
+fn rescore_gpu_half_precision_result(
+    search_result: Vec<ScoredPointOffset>,
+    deleted_points: &BitSlice,
+    vector_storage: &VectorStorageEnum,
+    query_vector: &QueryVector,
+    hardware_counter: HardwareCounterCell,
+) -> OperationResult<Vec<ScoredPointOffset>> {
+    if !get_gpu_force_half_precision() {
+        return Ok(search_result);
+    }
+
+    let mut scorer = FilteredScorer::new(
+        query_vector.to_owned(),
+        vector_storage,
+        None,
+        None,
+        deleted_points,
+        hardware_counter,
+    )?;
+    let mut point_ids = search_result
+        .into_iter()
+        .map(|point| point.idx)
+        .collect::<Vec<_>>();
+    let mut rescored = scorer.score_points(&mut point_ids, 0).collect::<Vec<_>>();
+    rescored.sort_unstable();
+    rescored.reverse();
+    Ok(rescored)
+}
 #[cfg(feature = "gpu")]
 use crate::index::hnsw_index::gpu::gpu_exact_search::{
     GPU_EXACT_SUBMISSION_BATCH_LIMIT, GpuExactSearchCache, GpuVisibilitySnapshot,
@@ -267,12 +309,13 @@ impl HNSWIndex {
         let Some(cache) = cache else {
             return Ok(None);
         };
+        let gpu_top = gpu_half_precision_search_top(top);
         let mut results = Vec::with_capacity(dense_queries.len());
         if let [query] = dense_queries.as_slice() {
             let Some(result) = cache.search_coalesced(
                 query,
                 candidates.clone(),
-                top,
+                gpu_top,
                 reuse_candidate_buffer,
                 visibility_snapshot,
             )?
@@ -283,7 +326,7 @@ impl HNSWIndex {
         } else {
             let submission_batch_size = if GpuExactSearchCache::supports_submission_batch(
                 candidates.len(),
-                top,
+                gpu_top,
                 reuse_candidate_buffer,
             ) {
                 GPU_EXACT_SUBMISSION_BATCH_LIMIT
@@ -294,7 +337,7 @@ impl HNSWIndex {
                 let Some(mut batch_results) = cache.search_batch(
                     queries,
                     candidates.clone(),
-                    top,
+                    gpu_top,
                     reuse_candidate_buffer,
                     visibility_snapshot,
                 )?
@@ -308,6 +351,13 @@ impl HNSWIndex {
         let postprocess_started = std::time::Instant::now();
         let quantized_vectors = self.quantized_vectors.borrow();
         for (search_result, query_vector) in results.iter_mut().zip(query_vectors) {
+            *search_result = rescore_gpu_half_precision_result(
+                std::mem::take(search_result),
+                deleted_points,
+                &vector_storage,
+                query_vector,
+                vector_query_context.hardware_counter(),
+            )?;
             *search_result = postprocess_search_result(
                 std::mem::take(search_result),
                 deleted_points,
@@ -478,12 +528,19 @@ impl HNSWIndex {
                         entry.idx,
                         candidates,
                         visibility_snapshot,
-                        oversampled_top,
+                        gpu_half_precision_search_top(oversampled_top),
                         ef,
                     )
                 });
                 match gpu_search {
                     Ok(Some(search_result)) => {
+                        let search_result = rescore_gpu_half_precision_result(
+                            search_result,
+                            id_tracker.deleted_point_bitslice(),
+                            &vector_storage,
+                            vector,
+                            vector_query_context.hardware_counter(),
+                        )?;
                         return postprocess_search_result(
                             search_result,
                             id_tracker.deleted_point_bitslice(),
