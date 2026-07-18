@@ -16,6 +16,9 @@ use crate::vector_storage::VectorStorageRead;
 
 const FILTER_CACHE_MAX_ENTRIES: usize = 4_096;
 const FILTER_CACHE_MAX_BYTES: usize = 64 * 1024 * 1024;
+const BLOCK_TOPK_MIN_CANDIDATES: usize = 65_536;
+const BLOCK_TOPK_LIMIT: usize = 16;
+const BLOCK_TOPK_TILE_CANDIDATES: usize = 128;
 
 /// Bounded, segment-local cache of payload-index candidate materializations.
 ///
@@ -252,7 +255,8 @@ impl GpuResidentCandidateCache {
 
 struct GpuExactSearchContext {
     context: gpu::Context,
-    pipeline: Arc<gpu::Pipeline>,
+    score_pipeline: Arc<gpu::Pipeline>,
+    block_topk_pipeline: Arc<gpu::Pipeline>,
     descriptor_set: Arc<gpu::DescriptorSet>,
     descriptor_set_layout: Arc<gpu::DescriptorSetLayout>,
     vector_storage: Arc<GpuVectorStorage>,
@@ -270,7 +274,8 @@ struct GpuExactSearchContext {
 impl GpuExactSearchContext {
     fn new(
         vector_storage: Arc<GpuVectorStorage>,
-        pipeline: Arc<gpu::Pipeline>,
+        score_pipeline: Arc<gpu::Pipeline>,
+        block_topk_pipeline: Arc<gpu::Pipeline>,
         descriptor_set_layout: Arc<gpu::DescriptorSetLayout>,
         candidate_capacity: usize,
         queue_index: usize,
@@ -326,7 +331,8 @@ impl GpuExactSearchContext {
 
         Ok(Self {
             context: gpu::Context::new_with_queue_index(device, queue_index)?,
-            pipeline,
+            score_pipeline,
+            block_topk_pipeline,
             descriptor_set,
             descriptor_set_layout,
             vector_storage,
@@ -380,6 +386,20 @@ impl GpuExactSearchContext {
         } else {
             self.descriptor_set.clone()
         };
+        let use_block_topk = resident_candidate_hit.is_some()
+            && candidates.len() >= BLOCK_TOPK_MIN_CANDIDATES
+            && top <= BLOCK_TOPK_LIMIT;
+        let block_count = candidates.len().div_ceil(BLOCK_TOPK_TILE_CANDIDATES);
+        let output_count = if use_block_topk {
+            block_count * BLOCK_TOPK_LIMIT
+        } else {
+            candidates.len()
+        };
+        let output_bytes = if use_block_topk {
+            output_count * std::mem::size_of::<ScoredPointOffset>()
+        } else {
+            output_count * std::mem::size_of::<f32>()
+        };
         let prepare_ns = prepare_started.elapsed().as_nanos() as u64;
 
         let gpu_submit_started = std::time::Instant::now();
@@ -403,10 +423,22 @@ impl GpuExactSearchContext {
         )?;
         self.context.barrier_buffers(&uploaded_buffers)?;
         self.context.bind_pipeline(
-            self.pipeline.clone(),
+            if use_block_topk {
+                self.block_topk_pipeline.clone()
+            } else {
+                self.score_pipeline.clone()
+            },
             &[descriptor_set, self.vector_storage.descriptor_set()],
         )?;
-        self.context.dispatch(candidates.len(), 1, 1)?;
+        self.context.dispatch(
+            if use_block_topk {
+                block_count
+            } else {
+                candidates.len()
+            },
+            1,
+            1,
+        )?;
         self.context
             .barrier_buffers(std::slice::from_ref(&self.score_buffer))?;
         self.context.copy_gpu_buffer(
@@ -414,7 +446,7 @@ impl GpuExactSearchContext {
             self.score_staging.clone(),
             0,
             0,
-            candidates.len() * std::mem::size_of::<f32>(),
+            output_bytes,
         )?;
         self.context.run()?;
         self.context.wait_finish(GPU_TIMEOUT)?;
@@ -422,14 +454,28 @@ impl GpuExactSearchContext {
         let gpu_d2h_ns = gpu_submit_started.elapsed().as_nanos() as u64;
 
         let download_started = std::time::Instant::now();
-        let scores = self
-            .score_staging
-            .download_vec::<f32>(0, candidates.len())?;
+        let block_results = use_block_topk
+            .then(|| {
+                self.score_staging
+                    .download_vec::<ScoredPointOffset>(0, output_count)
+            })
+            .transpose()?;
+        let scores = (!use_block_topk)
+            .then(|| self.score_staging.download_vec::<f32>(0, output_count))
+            .transpose()?;
         let download_ns = download_started.elapsed().as_nanos() as u64;
         let cpu_topk_started = std::time::Instant::now();
         let mut queue = TopK::new(top);
-        for (&idx, score) in candidates.iter().zip(scores) {
-            queue.push(ScoredPointOffset { idx, score });
+        if let Some(block_results) = block_results {
+            for point in block_results {
+                if point.idx != PointOffsetType::MAX {
+                    queue.push(point);
+                }
+            }
+        } else if let Some(scores) = scores {
+            for (&idx, score) in candidates.iter().zip(scores) {
+                queue.push(ScoredPointOffset { idx, score });
+            }
         }
         let result = queue.into_vec();
         let cpu_topk_ns = cpu_topk_started.elapsed().as_nanos() as u64;
@@ -523,14 +569,23 @@ impl GpuExactSearchCache {
             .add_storage_buffer(1)
             .add_storage_buffer(2)
             .build(device.clone())?;
-        let shader = ShaderBuilder::new(device.clone())
+        let score_shader = ShaderBuilder::new(device.clone())
             .with_shader_code(include_str!("shaders/run_exact_filtered_score.comp"))
             .with_parameters(vector_storage.as_ref())
             .build("run_exact_filtered_score.comp")?;
-        let pipeline = gpu::Pipeline::builder()
+        let score_pipeline = gpu::Pipeline::builder()
             .add_descriptor_set_layout(0, descriptor_set_layout.clone())
             .add_descriptor_set_layout(1, vector_storage.descriptor_set_layout())
-            .add_shader(shader)
+            .add_shader(score_shader)
+            .build(device.clone())?;
+        let block_topk_shader = ShaderBuilder::new(device.clone())
+            .with_shader_code(include_str!("shaders/run_exact_filtered_block_topk.comp"))
+            .with_parameters(vector_storage.as_ref())
+            .build("run_exact_filtered_block_topk.comp")?;
+        let block_topk_pipeline = gpu::Pipeline::builder()
+            .add_descriptor_set_layout(0, descriptor_set_layout.clone())
+            .add_descriptor_set_layout(1, vector_storage.descriptor_set_layout())
+            .add_shader(block_topk_shader)
             .build(device)?;
 
         let stats = Arc::new(GpuExactSearchStats::default());
@@ -538,7 +593,8 @@ impl GpuExactSearchCache {
             .map(|queue_index| {
                 GpuExactSearchContext::new(
                     vector_storage.clone(),
-                    pipeline.clone(),
+                    score_pipeline.clone(),
+                    block_topk_pipeline.clone(),
                     descriptor_set_layout.clone(),
                     candidate_capacity,
                     queue_index,
@@ -711,6 +767,72 @@ mod tests {
             for (actual, &(expected_id, expected_score)) in result.iter().zip(&expected[..TOP]) {
                 assert_eq!(actual.idx, expected_id);
                 assert!((actual.score - expected_score).abs() < 1e-4);
+            }
+        }
+    }
+
+    #[test]
+    fn exact_filtered_gpu_block_topk_matches_cpu_l2() {
+        const DIM: usize = 128;
+        const COUNT: usize = BLOCK_TOPK_MIN_CANDIDATES;
+        const TARGET: usize = 12_345;
+        const TOP: usize = 10;
+
+        let vectors = (0..COUNT)
+            .map(|row| {
+                (0..DIM)
+                    .map(|column| {
+                        ((row * 17 + column * 13 + row * column * 7) % 65_521) as f32 / 65_521.0
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .collect::<Vec<_>>();
+        let query = vectors[TARGET].clone();
+        let mut storage = new_volatile_dense_vector_storage(DIM, Distance::Euclid);
+        let counter = HardwareCounterCell::new();
+        for (idx, vector) in vectors.iter().enumerate() {
+            storage
+                .insert_vector(idx as PointOffsetType, vector.as_slice().into(), &counter)
+                .unwrap();
+        }
+
+        let instance = gpu::Instance::builder().build().unwrap();
+        let device = gpu::Device::new(instance.clone(), &instance.physical_devices()[0]).unwrap();
+        let stopped = AtomicBool::new(false);
+        let cache = GpuExactSearchCache::new(device, &storage, COUNT, 1, &stopped).unwrap();
+        let candidates = Arc::new((0..COUNT as PointOffsetType).collect::<Vec<_>>());
+
+        let mut expected = vectors
+            .iter()
+            .enumerate()
+            .map(|(idx, vector)| {
+                let score = -vector
+                    .iter()
+                    .zip(query.iter())
+                    .map(|(left, right)| (left - right) * (left - right))
+                    .sum::<f32>();
+                ScoredPointOffset {
+                    idx: idx as PointOffsetType,
+                    score,
+                }
+            })
+            .collect::<Vec<_>>();
+        expected.sort_by(|left, right| {
+            right
+                .score
+                .total_cmp(&left.score)
+                .then_with(|| left.idx.cmp(&right.idx))
+        });
+
+        for _ in 0..2 {
+            let result = cache
+                .search(query.as_slice(), candidates.clone(), TOP, true)
+                .unwrap()
+                .unwrap();
+            assert_eq!(result[0].idx, TARGET as PointOffsetType);
+            for (actual, expected) in result.iter().zip(&expected[..TOP]) {
+                assert_eq!(actual.idx, expected.idx);
+                assert!((actual.score - expected.score).abs() < 1e-4);
             }
         }
     }
