@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::fmt;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -10,7 +11,74 @@ use super::GPU_TIMEOUT;
 use super::gpu_vector_storage::GpuVectorStorage;
 use super::shader_builder::ShaderBuilder;
 use crate::common::operation_error::{OperationError, OperationResult};
+use crate::types::Filter;
 use crate::vector_storage::VectorStorageRead;
+
+const FILTER_CACHE_MAX_ENTRIES: usize = 4_096;
+const FILTER_CACHE_MAX_BYTES: usize = 64 * 1024 * 1024;
+
+/// Bounded, segment-local cache of payload-index candidate materializations.
+///
+/// The owning HNSW index only consults this cache for immutable segments and
+/// payload-only filters. `payload_epoch` is advanced by every payload/index
+/// mutation, so a hit always belongs to the same payload-index snapshot.
+#[derive(Debug, Default)]
+pub struct GpuFilterCandidateCache {
+    payload_epoch: u64,
+    entries: HashMap<Filter, Arc<Vec<PointOffsetType>>>,
+    cached_points: usize,
+}
+
+impl GpuFilterCandidateCache {
+    pub fn clear(&mut self) {
+        self.entries.clear();
+        self.cached_points = 0;
+    }
+
+    fn synchronize_epoch(&mut self, payload_epoch: u64) {
+        if self.payload_epoch != payload_epoch {
+            self.clear();
+            self.payload_epoch = payload_epoch;
+        }
+    }
+
+    pub fn get(
+        &mut self,
+        filter: &Filter,
+        payload_epoch: u64,
+    ) -> Option<Arc<Vec<PointOffsetType>>> {
+        self.synchronize_epoch(payload_epoch);
+        self.entries.get(filter).cloned()
+    }
+
+    pub fn insert(
+        &mut self,
+        filter: Filter,
+        candidates: Arc<Vec<PointOffsetType>>,
+        payload_epoch: u64,
+    ) {
+        self.synchronize_epoch(payload_epoch);
+        let candidate_bytes = candidates
+            .len()
+            .saturating_mul(std::mem::size_of::<PointOffsetType>());
+        if candidate_bytes > FILTER_CACHE_MAX_BYTES {
+            return;
+        }
+        if self.entries.contains_key(&filter) {
+            return;
+        }
+        let current_bytes = self
+            .cached_points
+            .saturating_mul(std::mem::size_of::<PointOffsetType>());
+        if self.entries.len() >= FILTER_CACHE_MAX_ENTRIES
+            || current_bytes.saturating_add(candidate_bytes) > FILTER_CACHE_MAX_BYTES
+        {
+            self.clear();
+        }
+        self.cached_points = self.cached_points.saturating_add(candidates.len());
+        self.entries.insert(filter, candidates);
+    }
+}
 
 #[derive(Default)]
 struct GpuExactSearchStats {
@@ -26,6 +94,10 @@ struct GpuExactSearchStats {
     download_ns: AtomicU64,
     cpu_topk_ns: AtomicU64,
     postprocess_ns: AtomicU64,
+    filter_cache_hits: AtomicU64,
+    filter_cache_misses: AtomicU64,
+    resident_candidate_hits: AtomicU64,
+    resident_candidate_misses: AtomicU64,
 }
 
 impl GpuExactSearchStats {
@@ -41,6 +113,7 @@ impl GpuExactSearchStats {
         gpu_d2h_ns: u64,
         download_ns: u64,
         cpu_topk_ns: u64,
+        resident_candidate_hit: Option<bool>,
     ) {
         Self::add(&self.candidates, candidates as u64);
         Self::add(&self.prepare_ns, prepare_ns);
@@ -48,6 +121,11 @@ impl GpuExactSearchStats {
         Self::add(&self.gpu_d2h_ns, gpu_d2h_ns);
         Self::add(&self.download_ns, download_ns);
         Self::add(&self.cpu_topk_ns, cpu_topk_ns);
+        match resident_candidate_hit {
+            Some(true) => Self::add(&self.resident_candidate_hits, 1),
+            Some(false) => Self::add(&self.resident_candidate_misses, 1),
+            None => {}
+        }
     }
 
     fn record_outer(
@@ -56,11 +134,17 @@ impl GpuExactSearchStats {
         visibility_ns: u64,
         cache_ns: u64,
         postprocess_ns: u64,
+        filter_cache_hit: Option<bool>,
     ) {
         Self::add(&self.predicate_ns, predicate_ns);
         Self::add(&self.visibility_ns, visibility_ns);
         Self::add(&self.cache_ns, cache_ns);
         Self::add(&self.postprocess_ns, postprocess_ns);
+        match filter_cache_hit {
+            Some(true) => Self::add(&self.filter_cache_hits, 1),
+            Some(false) => Self::add(&self.filter_cache_misses, 1),
+            None => {}
+        }
 
         let sequence = self.total_queries.fetch_add(1, Ordering::Relaxed) + 1;
         self.window_queries.fetch_add(1, Ordering::Relaxed);
@@ -80,13 +164,30 @@ impl GpuExactSearchStats {
         let download_ns = take(&self.download_ns);
         let cpu_topk_ns = take(&self.cpu_topk_ns);
         let postprocess_ns = take(&self.postprocess_ns);
+        let filter_cache_hits = take(&self.filter_cache_hits);
+        let filter_cache_misses = take(&self.filter_cache_misses);
+        let filter_cache_lookups = filter_cache_hits + filter_cache_misses;
+        let filter_cache_hit_rate = if filter_cache_lookups == 0 {
+            0.0
+        } else {
+            filter_cache_hits as f64 / filter_cache_lookups as f64
+        };
+        let resident_candidate_hits = take(&self.resident_candidate_hits);
+        let resident_candidate_misses = take(&self.resident_candidate_misses);
+        let resident_candidate_lookups = resident_candidate_hits + resident_candidate_misses;
+        let resident_candidate_hit_rate = if resident_candidate_lookups == 0 {
+            0.0
+        } else {
+            resident_candidate_hits as f64 / resident_candidate_lookups as f64
+        };
         let average_us = |value: u64| value as f64 / queries as f64 / 1_000.0;
 
         log::info!(
             "GPU exact filtered breakdown: sequence={sequence}, window_queries={queries}, \
              avg_candidates={:.1}, predicate_us={:.3}, visibility_us={:.3}, cache_us={:.3}, \
              prepare_us={:.3}, h2d_us={:.3}, gpu_d2h_us={:.3}, mapped_download_us={:.3}, \
-             cpu_topk_us={:.3}, postprocess_us={:.3}",
+             cpu_topk_us={:.3}, postprocess_us={:.3}, filter_cache_hit_rate={:.3}, \
+             resident_candidate_hit_rate={:.3}",
             candidates as f64 / queries as f64,
             average_us(predicate_ns),
             average_us(visibility_ns),
@@ -97,7 +198,55 @@ impl GpuExactSearchStats {
             average_us(download_ns),
             average_us(cpu_topk_ns),
             average_us(postprocess_ns),
+            filter_cache_hit_rate,
+            resident_candidate_hit_rate,
         );
+    }
+}
+
+struct GpuResidentCandidateEntry {
+    candidates: Arc<Vec<PointOffsetType>>,
+    buffer: Arc<gpu::Buffer>,
+}
+
+#[derive(Default)]
+struct GpuResidentCandidateCache {
+    entries: HashMap<usize, GpuResidentCandidateEntry>,
+    cached_bytes: usize,
+}
+
+impl GpuResidentCandidateCache {
+    fn clear(&mut self) {
+        self.entries.clear();
+        self.cached_bytes = 0;
+    }
+
+    fn get(&self, candidates: &Arc<Vec<PointOffsetType>>) -> Option<Arc<gpu::Buffer>> {
+        let key = Arc::as_ptr(candidates) as usize;
+        self.entries.get(&key).and_then(|entry| {
+            Arc::ptr_eq(&entry.candidates, candidates).then(|| entry.buffer.clone())
+        })
+    }
+
+    fn insert(&mut self, candidates: Arc<Vec<PointOffsetType>>, buffer: Arc<gpu::Buffer>) {
+        let candidate_bytes = candidates
+            .len()
+            .saturating_mul(std::mem::size_of::<PointOffsetType>());
+        if candidate_bytes > FILTER_CACHE_MAX_BYTES {
+            return;
+        }
+        if self.entries.len() >= FILTER_CACHE_MAX_ENTRIES
+            || self.cached_bytes.saturating_add(candidate_bytes) > FILTER_CACHE_MAX_BYTES
+        {
+            self.clear();
+        }
+        let key = Arc::as_ptr(&candidates) as usize;
+        if self.entries.contains_key(&key) {
+            return;
+        }
+        self.cached_bytes = self.cached_bytes.saturating_add(candidate_bytes);
+        self.entries
+            .insert(key, GpuResidentCandidateEntry { candidates, buffer });
     }
 }
 
@@ -105,6 +254,7 @@ struct GpuExactSearchContext {
     context: gpu::Context,
     pipeline: Arc<gpu::Pipeline>,
     descriptor_set: Arc<gpu::DescriptorSet>,
+    descriptor_set_layout: Arc<gpu::DescriptorSetLayout>,
     vector_storage: Arc<GpuVectorStorage>,
     candidate_buffer: Arc<gpu::Buffer>,
     candidate_staging: Arc<gpu::Buffer>,
@@ -168,7 +318,7 @@ impl GpuExactSearchContext {
             gpu::BufferType::GpuToCpu,
             score_bytes,
         )?;
-        let descriptor_set = gpu::DescriptorSet::builder(descriptor_set_layout)
+        let descriptor_set = gpu::DescriptorSet::builder(descriptor_set_layout.clone())
             .add_storage_buffer(0, candidate_buffer.clone())
             .add_storage_buffer(1, query_buffer.clone())
             .add_storage_buffer(2, score_buffer.clone())
@@ -178,6 +328,7 @@ impl GpuExactSearchContext {
             context: gpu::Context::new_with_queue_index(device, queue_index)?,
             pipeline,
             descriptor_set,
+            descriptor_set_layout,
             vector_storage,
             candidate_buffer,
             candidate_staging,
@@ -196,6 +347,8 @@ impl GpuExactSearchContext {
         query: &[f32],
         candidates: &[PointOffsetType],
         top: usize,
+        resident_candidate_buffer: Option<Arc<gpu::Buffer>>,
+        resident_candidate_hit: Option<bool>,
     ) -> OperationResult<Vec<ScoredPointOffset>> {
         if candidates.len() > self.candidate_capacity {
             return Err(OperationError::service_error(
@@ -214,18 +367,33 @@ impl GpuExactSearchContext {
         let prepare_started = std::time::Instant::now();
         let mut padded_query = vec![0.0f32; self.query_capacity];
         padded_query[..query.len()].copy_from_slice(query);
-        self.candidate_staging.upload(candidates, 0)?;
+        if resident_candidate_buffer.is_none() {
+            self.candidate_staging.upload(candidates, 0)?;
+        }
         self.query_staging.upload(padded_query.as_slice(), 0)?;
+        let descriptor_set = if let Some(candidate_buffer) = resident_candidate_buffer {
+            gpu::DescriptorSet::builder(self.descriptor_set_layout.clone())
+                .add_storage_buffer(0, candidate_buffer)
+                .add_storage_buffer(1, self.query_buffer.clone())
+                .add_storage_buffer(2, self.score_buffer.clone())
+                .build()?
+        } else {
+            self.descriptor_set.clone()
+        };
         let prepare_ns = prepare_started.elapsed().as_nanos() as u64;
 
-        let h2d_started = std::time::Instant::now();
-        self.context.copy_gpu_buffer(
-            self.candidate_staging.clone(),
-            self.candidate_buffer.clone(),
-            0,
-            0,
-            std::mem::size_of_val(candidates),
-        )?;
+        let gpu_submit_started = std::time::Instant::now();
+        let mut uploaded_buffers = vec![self.query_buffer.clone()];
+        if resident_candidate_hit.is_none() {
+            self.context.copy_gpu_buffer(
+                self.candidate_staging.clone(),
+                self.candidate_buffer.clone(),
+                0,
+                0,
+                std::mem::size_of_val(candidates),
+            )?;
+            uploaded_buffers.push(self.candidate_buffer.clone());
+        }
         self.context.copy_gpu_buffer(
             self.query_staging.clone(),
             self.query_buffer.clone(),
@@ -233,17 +401,10 @@ impl GpuExactSearchContext {
             0,
             padded_query.len() * std::mem::size_of::<f32>(),
         )?;
-        self.context.run()?;
-        self.context.wait_finish(GPU_TIMEOUT)?;
-        let h2d_ns = h2d_started.elapsed().as_nanos() as u64;
-
-        let gpu_d2h_started = std::time::Instant::now();
+        self.context.barrier_buffers(&uploaded_buffers)?;
         self.context.bind_pipeline(
             self.pipeline.clone(),
-            &[
-                self.descriptor_set.clone(),
-                self.vector_storage.descriptor_set(),
-            ],
+            &[descriptor_set, self.vector_storage.descriptor_set()],
         )?;
         self.context.dispatch(candidates.len(), 1, 1)?;
         self.context
@@ -257,10 +418,13 @@ impl GpuExactSearchContext {
         )?;
         self.context.run()?;
         self.context.wait_finish(GPU_TIMEOUT)?;
-        let gpu_d2h_ns = gpu_d2h_started.elapsed().as_nanos() as u64;
+        let h2d_ns = 0;
+        let gpu_d2h_ns = gpu_submit_started.elapsed().as_nanos() as u64;
 
         let download_started = std::time::Instant::now();
-        let scores = self.score_staging.download_vec::<f32>(0, candidates.len())?;
+        let scores = self
+            .score_staging
+            .download_vec::<f32>(0, candidates.len())?;
         let download_ns = download_started.elapsed().as_nanos() as u64;
         let cpu_topk_started = std::time::Instant::now();
         let mut queue = TopK::new(top);
@@ -276,13 +440,39 @@ impl GpuExactSearchContext {
             gpu_d2h_ns,
             download_ns,
             cpu_topk_ns,
+            resident_candidate_hit,
         );
         Ok(result)
+    }
+
+    fn upload_resident_candidates(
+        &mut self,
+        candidates: &[PointOffsetType],
+    ) -> OperationResult<Arc<gpu::Buffer>> {
+        let candidate_bytes = std::mem::size_of_val(candidates);
+        let candidate_buffer = gpu::Buffer::new(
+            self.vector_storage.device(),
+            "Resident exact filtered candidate IDs",
+            gpu::BufferType::Storage,
+            candidate_bytes,
+        )?;
+        self.candidate_staging.upload(candidates, 0)?;
+        self.context.copy_gpu_buffer(
+            self.candidate_staging.clone(),
+            candidate_buffer.clone(),
+            0,
+            0,
+            candidate_bytes,
+        )?;
+        self.context.run()?;
+        self.context.wait_finish(GPU_TIMEOUT)?;
+        Ok(candidate_buffer)
     }
 }
 
 pub struct GpuExactSearchCache {
     contexts: Mutex<Vec<GpuExactSearchContext>>,
+    resident_candidates: Mutex<GpuResidentCandidateCache>,
     candidate_capacity: usize,
     context_count: usize,
     stats: Arc<GpuExactSearchStats>,
@@ -299,6 +489,10 @@ impl fmt::Debug for GpuExactSearchCache {
 }
 
 impl GpuExactSearchCache {
+    pub fn clear_resident_candidates(&self) {
+        self.resident_candidates.lock().clear();
+    }
+
     pub fn new(
         device: Arc<gpu::Device>,
         vector_storage: &crate::vector_storage::VectorStorageEnum,
@@ -355,6 +549,7 @@ impl GpuExactSearchCache {
 
         Ok(Self {
             contexts: Mutex::new(contexts),
+            resident_candidates: Mutex::new(GpuResidentCandidateCache::default()),
             candidate_capacity,
             context_count,
             stats,
@@ -364,13 +559,34 @@ impl GpuExactSearchCache {
     pub fn search(
         &self,
         query: &[f32],
-        candidates: &[PointOffsetType],
+        candidates: Arc<Vec<PointOffsetType>>,
         top: usize,
+        reuse_candidate_buffer: bool,
     ) -> OperationResult<Option<Vec<ScoredPointOffset>>> {
         let Some(mut context) = self.contexts.lock().pop() else {
             return Ok(None);
         };
-        let result = context.search(query, candidates, top);
+        let result = (|| {
+            let (resident_candidate_buffer, resident_candidate_hit) = if reuse_candidate_buffer {
+                let mut resident_candidates = self.resident_candidates.lock();
+                if let Some(buffer) = resident_candidates.get(&candidates) {
+                    (Some(buffer), Some(true))
+                } else {
+                    let buffer = context.upload_resident_candidates(candidates.as_slice())?;
+                    resident_candidates.insert(candidates.clone(), buffer.clone());
+                    (Some(buffer), Some(false))
+                }
+            } else {
+                (None, None)
+            };
+            context.search(
+                query,
+                candidates.as_slice(),
+                top,
+                resident_candidate_buffer,
+                resident_candidate_hit,
+            )
+        })();
         self.contexts.lock().push(context);
         result.map(Some)
     }
@@ -381,9 +597,15 @@ impl GpuExactSearchCache {
         visibility_ns: u64,
         cache_ns: u64,
         postprocess_ns: u64,
+        filter_cache_hit: Option<bool>,
     ) {
-        self.stats
-            .record_outer(predicate_ns, visibility_ns, cache_ns, postprocess_ns);
+        self.stats.record_outer(
+            predicate_ns,
+            visibility_ns,
+            cache_ns,
+            postprocess_ns,
+            filter_cache_hit,
+        );
     }
 }
 
@@ -399,6 +621,18 @@ mod tests {
     use crate::vector_storage::dense::volatile_dense_vector_storage::new_volatile_dense_vector_storage;
 
     #[test]
+    fn filter_candidate_cache_is_epoch_scoped() {
+        let filter = Filter::new();
+        let candidates = Arc::new(vec![1, 3, 5]);
+        let mut cache = GpuFilterCandidateCache::default();
+
+        assert!(cache.get(&filter, 7).is_none());
+        cache.insert(filter.clone(), candidates.clone(), 7);
+        assert_eq!(cache.get(&filter, 7).as_deref(), Some(candidates.as_ref()));
+        assert!(cache.get(&filter, 8).is_none());
+    }
+
+    #[test]
     fn exact_filtered_gpu_matches_cpu_l2() {
         const DIM: usize = 128;
         const COUNT: usize = 1_024;
@@ -409,8 +643,7 @@ mod tests {
             .map(|row| {
                 (0..DIM)
                     .map(|column| {
-                        ((row * 17 + column * 13 + row * column * 7) % 65_521) as f32
-                            / 65_521.0
+                        ((row * 17 + column * 13 + row * column * 7) % 65_521) as f32 / 65_521.0
                     })
                     .collect::<Vec<_>>()
             })
@@ -427,27 +660,32 @@ mod tests {
         let instance = gpu::Instance::builder().build().unwrap();
         let device = gpu::Device::new(instance.clone(), &instance.physical_devices()[0]).unwrap();
         let stopped = AtomicBool::new(false);
-        let cache = Arc::new(
-            GpuExactSearchCache::new(device, &storage, COUNT, 8, &stopped).unwrap(),
-        );
+        let cache =
+            Arc::new(GpuExactSearchCache::new(device, &storage, COUNT, 8, &stopped).unwrap());
         let query = Arc::new(query);
         let candidates = Arc::new((0..COUNT as PointOffsetType).collect::<Vec<_>>());
-        let observed = (0..8)
-            .map(|_| {
-                let cache = cache.clone();
-                let query = query.clone();
-                let candidates = candidates.clone();
-                std::thread::spawn(move || {
-                    cache
-                        .search(query.as_slice(), candidates.as_slice(), TOP)
-                        .unwrap()
-                        .unwrap()
+        let mut observed = Vec::new();
+        for reuse_candidate_buffer in [false, true] {
+            let threads = (0..8)
+                .map(|_| {
+                    let cache = cache.clone();
+                    let query = query.clone();
+                    let candidates = candidates.clone();
+                    std::thread::spawn(move || {
+                        cache
+                            .search(
+                                query.as_slice(),
+                                candidates.clone(),
+                                TOP,
+                                reuse_candidate_buffer,
+                            )
+                            .unwrap()
+                            .unwrap()
+                    })
                 })
-            })
-            .collect::<Vec<_>>()
-            .into_iter()
-            .map(|thread| thread.join().unwrap())
-            .collect::<Vec<_>>();
+                .collect::<Vec<_>>();
+            observed.extend(threads.into_iter().map(|thread| thread.join().unwrap()));
+        }
 
         let mut expected = vectors
             .iter()

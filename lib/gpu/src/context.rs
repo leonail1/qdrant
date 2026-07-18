@@ -152,7 +152,9 @@ impl Context {
                     .size(buffer.size() as vk::DeviceSize)
                     .src_queue_family_index(self.vk_queue_family_index as u32)
                     .dst_queue_family_index(self.vk_queue_family_index as u32)
-                    .src_access_mask(vk::AccessFlags::SHADER_WRITE)
+                    .src_access_mask(
+                        vk::AccessFlags::SHADER_WRITE | vk::AccessFlags::TRANSFER_WRITE,
+                    )
                     .dst_access_mask(
                         vk::AccessFlags::TRANSFER_READ
                             | vk::AccessFlags::SHADER_READ
@@ -164,7 +166,7 @@ impl Context {
         unsafe {
             self.device.vk_device().cmd_pipeline_barrier(
                 self.vk_command_buffer,
-                vk::PipelineStageFlags::COMPUTE_SHADER,
+                vk::PipelineStageFlags::COMPUTE_SHADER | vk::PipelineStageFlags::TRANSFER,
                 vk::PipelineStageFlags::ALL_COMMANDS,
                 vk::DependencyFlags::empty(),
                 &[],

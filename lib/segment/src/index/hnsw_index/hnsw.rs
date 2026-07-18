@@ -5,19 +5,23 @@ use std::sync::OnceLock;
 
 use atomic_refcell::AtomicRefCell;
 use common::universal_io::MmapFs;
+#[cfg(feature = "gpu")]
+use parking_lot::Mutex;
 
 use self::telemetry::HNSWSearchesTelemetry;
 use crate::common::BYTES_IN_KB;
 use crate::common::operation_error::OperationResult;
 use crate::id_tracker::IdTrackerEnum;
 use crate::index::hnsw_index::config::HnswGraphConfig;
+#[cfg(feature = "gpu")]
+use crate::index::hnsw_index::gpu::gpu_exact_search::{
+    GpuExactSearchCache, GpuFilterCandidateCache,
+};
 use crate::index::hnsw_index::graph_layers::{GraphLayers, LoadOption};
 use crate::index::struct_payload_index::StructPayloadIndex;
 use crate::types::HnswConfig;
 use crate::vector_storage::quantized::quantized_vectors::QuantizedVectors;
 use crate::vector_storage::{VectorStorageEnum, VectorStorageRead};
-#[cfg(feature = "gpu")]
-use crate::index::hnsw_index::gpu::gpu_exact_search::GpuExactSearchCache;
 
 mod build;
 #[cfg(feature = "gpu")]
@@ -52,6 +56,8 @@ pub struct HNSWIndex {
     is_on_disk: bool,
     #[cfg(feature = "gpu")]
     gpu_exact_search: OnceLock<Option<Arc<GpuExactSearchCache>>>,
+    #[cfg(feature = "gpu")]
+    gpu_filter_candidates: Mutex<GpuFilterCandidateCache>,
 }
 
 pub struct HnswIndexOpenArgs<'a> {
@@ -126,6 +132,8 @@ impl HNSWIndex {
             is_on_disk,
             #[cfg(feature = "gpu")]
             gpu_exact_search: OnceLock::new(),
+            #[cfg(feature = "gpu")]
+            gpu_filter_candidates: Mutex::new(GpuFilterCandidateCache::default()),
         })
     }
 
@@ -160,9 +168,18 @@ impl HNSWIndex {
             searches_telemetry: _,
             is_on_disk: _,
             #[cfg(feature = "gpu")]
-            gpu_exact_search: _,
+            gpu_exact_search,
+            #[cfg(feature = "gpu")]
+            gpu_filter_candidates,
         } = self;
         graph.clear_cache()?;
+        #[cfg(feature = "gpu")]
+        {
+            gpu_filter_candidates.lock().clear();
+            if let Some(Some(cache)) = gpu_exact_search.get() {
+                cache.clear_resident_candidates();
+            }
+        }
         Ok(())
     }
 }

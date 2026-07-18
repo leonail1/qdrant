@@ -46,6 +46,7 @@ impl PayloadIndex for StructPayloadIndex {
         payload_schema: PayloadFieldSchema,
         field_index: Vec<FieldIndex>,
     ) -> OperationResult<()> {
+        self.bump_mutation_epoch();
         let index_types: Vec<_> = field_index
             .iter()
             .map(|i| i.get_full_index_type())
@@ -98,6 +99,10 @@ impl PayloadIndex for StructPayloadIndex {
 
         let is_removed = removed_config.is_some() || removed_indexes.is_some();
 
+        if is_removed {
+            self.bump_mutation_epoch();
+        }
+
         if let Some(indexes) = removed_indexes {
             for index in indexes {
                 index.wipe()?;
@@ -143,6 +148,7 @@ impl PayloadIndex for StructPayloadIndex {
         payload: &Payload,
         hw_counter: &HardwareCounterCell,
     ) -> OperationResult<()> {
+        self.bump_mutation_epoch();
         self.payload
             .borrow_mut()
             .overwrite(point_id, payload, hw_counter)?;
@@ -169,6 +175,7 @@ impl PayloadIndex for StructPayloadIndex {
         key: &Option<JsonPath>,
         hw_counter: &HardwareCounterCell,
     ) -> OperationResult<()> {
+        self.bump_mutation_epoch();
         if let Some(key) = key {
             self.payload
                 .borrow_mut()
@@ -207,6 +214,7 @@ impl PayloadIndex for StructPayloadIndex {
         key: PayloadKeyTypeRef,
         hw_counter: &HardwareCounterCell,
     ) -> OperationResult<Vec<Value>> {
+        self.bump_mutation_epoch();
         if let Some(indexes) = self.field_indexes.get_mut(key) {
             for index in indexes {
                 index.remove_point(point_id)?;
@@ -220,6 +228,7 @@ impl PayloadIndex for StructPayloadIndex {
         point_id: PointOffsetType,
         hw_counter: &HardwareCounterCell,
     ) -> OperationResult<Option<Payload>> {
+        self.bump_mutation_epoch();
         self.clear_index_for_point(point_id)?;
         self.payload.borrow_mut().clear(point_id, hw_counter)
     }

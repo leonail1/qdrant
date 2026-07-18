@@ -10,6 +10,7 @@ mod tests;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
 
 use atomic_refcell::AtomicRefCell;
@@ -55,6 +56,8 @@ pub struct StructPayloadIndex {
     pub(super) visited_pool: VisitedPool,
     /// Desired storage type for payload indices, used in builder to pick correct type
     storage_type: StorageType,
+    /// Monotonic invalidation token for cached filter materializations.
+    mutation_epoch: AtomicU64,
 }
 
 impl StructPayloadIndex {
@@ -218,6 +221,7 @@ impl StructPayloadIndex {
             path: path.to_owned(),
             visited_pool: Default::default(),
             storage_type,
+            mutation_epoch: AtomicU64::new(1),
         };
 
         if !index.config_path().exists() {
@@ -240,6 +244,7 @@ impl StructPayloadIndex {
         vector_name: VectorNameBuf,
         vector_storage: Arc<AtomicRefCell<VectorStorageEnum>>,
     ) {
+        self.bump_mutation_epoch();
         self.vector_storages.insert(vector_name, vector_storage);
     }
 
@@ -249,7 +254,21 @@ impl StructPayloadIndex {
     /// `has_vector` queries will keep matching points against the deleted storage
     /// until the segment is reloaded.
     pub fn unregister_vector_storage(&mut self, vector_name: &str) {
-        self.vector_storages.remove(vector_name);
+        if self.vector_storages.remove(vector_name).is_some() {
+            self.bump_mutation_epoch();
+        }
+    }
+
+    pub fn mutation_epoch(&self) -> u64 {
+        self.mutation_epoch.load(Ordering::Acquire)
+    }
+
+    pub(super) fn bump_mutation_epoch(&self) {
+        self.mutation_epoch.fetch_add(1, Ordering::AcqRel);
+    }
+
+    pub fn is_appendable(&self) -> bool {
+        matches!(&self.storage_type, StorageType::GridstoreAppendable)
     }
 
     /// Number of available points

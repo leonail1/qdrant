@@ -1,3 +1,5 @@
+use std::sync::Arc;
+
 use common::bitvec::BitSlice;
 use common::counter::hardware_counter::HardwareCounterCell;
 use common::cow::BoxCow;
@@ -16,10 +18,22 @@ use crate::index::vector_index_search_common::{
     get_oversampled_top, is_quantized_search, postprocess_search_result,
 };
 use crate::payload_storage::FilterContext;
+#[cfg(feature = "gpu")]
+use crate::types::Condition;
 use crate::types::{ACORN_MAX_SELECTIVITY_DEFAULT, Filter, SearchParams};
 use crate::vector_storage::quantized::quantized_vectors::QuantizedVectors;
 use crate::vector_storage::query::DiscoverQuery;
 use crate::vector_storage::{VectorStorageEnum, VectorStorageRead, new_raw_scorer};
+
+#[cfg(feature = "gpu")]
+fn gpu_filter_cacheable(filter: &Filter) -> bool {
+    filter.iter_conditions().all(|condition| match condition {
+        Condition::Field(_) | Condition::IsEmpty(_) | Condition::IsNull(_) => true,
+        Condition::Nested(nested) => gpu_filter_cacheable(nested.filter()),
+        Condition::Filter(filter) => gpu_filter_cacheable(filter),
+        Condition::HasId(_) | Condition::HasVector(_) | Condition::CustomIdChecker(_) => false,
+    })
+}
 #[cfg(feature = "gpu")]
 use crate::index::hnsw_index::gpu::gpu_exact_search::GpuExactSearchCache;
 #[cfg(feature = "gpu")]
@@ -74,11 +88,12 @@ impl HNSWIndex {
     fn search_plain_gpu_exact(
         &self,
         query_vectors: &[&QueryVector],
-        filtered_points: &[PointOffsetType],
+        filtered_points: &Arc<Vec<PointOffsetType>>,
         top: usize,
         params: Option<&SearchParams>,
         vector_query_context: &VectorQueryContext,
         predicate_ns: u64,
+        filter_cache_hit: Option<bool>,
     ) -> OperationResult<Option<Vec<Vec<ScoredPointOffset>>>> {
         let config = get_gpu_search_config();
         if !config.enabled || !params.is_some_and(|params| params.exact) {
@@ -102,33 +117,40 @@ impl HNSWIndex {
             .unwrap_or_else(|| id_tracker.deleted_point_bitslice());
         let deleted_vectors = vector_storage.deleted_vector_bitslice();
         let visibility_started = std::time::Instant::now();
-        let candidates = filtered_points
-            .iter()
-            .copied()
-            .filter(|&point_id| {
-                check_deleted_condition(point_id, deleted_vectors, deleted_points)
-            })
-            .collect::<Vec<_>>();
+        let reuse_candidate_buffer = filter_cache_hit.is_some()
+            && vector_query_context.deleted_points().is_none()
+            && id_tracker.deleted_point_count() == 0
+            && vector_storage.deleted_vector_count() == 0;
+        let candidates = if reuse_candidate_buffer {
+            filtered_points.clone()
+        } else {
+            Arc::new(
+                filtered_points
+                    .iter()
+                    .copied()
+                    .filter(|&point_id| {
+                        check_deleted_condition(point_id, deleted_vectors, deleted_points)
+                    })
+                    .collect::<Vec<_>>(),
+            )
+        };
         let visibility_ns = visibility_started.elapsed().as_nanos() as u64;
-        if candidates.len() < config.min_candidates
-            || candidates.len() > config.max_candidates
-        {
+        if candidates.len() < config.min_candidates || candidates.len() > config.max_candidates {
             return Ok(None);
         }
 
         let cache_started = std::time::Instant::now();
-        let cache = self.gpu_exact_search_cache(
-            &vector_storage,
-            &vector_query_context.is_stopped(),
-        );
+        let cache =
+            self.gpu_exact_search_cache(&vector_storage, &vector_query_context.is_stopped());
         let cache_ns = cache_started.elapsed().as_nanos() as u64;
-        let Some(cache) = cache
-        else {
+        let Some(cache) = cache else {
             return Ok(None);
         };
         let mut results = Vec::with_capacity(dense_queries.len());
         for query in dense_queries {
-            let Some(result) = cache.search(query, &candidates, top)? else {
+            let Some(result) =
+                cache.search(query, candidates.clone(), top, reuse_candidate_buffer)?
+            else {
                 return Ok(None);
             };
             results.push(result);
@@ -154,6 +176,7 @@ impl HNSWIndex {
             visibility_ns,
             cache_ns,
             postprocess_ns,
+            filter_cache_hit,
         );
         Ok(Some(results))
     }
@@ -437,24 +460,65 @@ impl HNSWIndex {
         let hw_counter = &vector_query_context.hardware_counter();
         let is_stopped = &vector_query_context.is_stopped();
 
-        #[cfg(feature = "gpu")]
-        let predicate_started = std::time::Instant::now();
         let payload_index = self.payload_index.borrow();
-        // Assume query is already estimated to be small enough so we can iterate over all matched ids
-        let filtered_points: Vec<PointOffsetType> = payload_index.with_view(|v| {
+
+        #[cfg(feature = "gpu")]
+        let (filtered_points, predicate_ns, filter_cache_hit) = {
+            let predicate_started = std::time::Instant::now();
+            let cacheable = get_gpu_search_config().enabled
+                && params.is_some_and(|params| params.exact)
+                && !payload_index.is_appendable()
+                && gpu_filter_cacheable(filter);
+            let payload_epoch = payload_index.mutation_epoch();
+            let cached = cacheable
+                .then(|| self.gpu_filter_candidates.lock().get(filter, payload_epoch))
+                .flatten();
+            let cache_hit = cacheable.then_some(cached.is_some());
+            let candidates = if let Some(candidates) = cached {
+                candidates
+            } else {
+                // Assume query is already estimated to be small enough so we can iterate over all matched ids.
+                let candidates = Arc::new(payload_index.with_view(|v| {
+                    let query_cardinality = v.estimate_cardinality(filter, hw_counter)?;
+                    v.iter_filtered_points(
+                        filter,
+                        &query_cardinality,
+                        hw_counter,
+                        is_stopped,
+                        // No deferred filtering here since it is an HNSW index.
+                        DeferredBehavior::IncludeAll,
+                    )
+                    .map(|it| it.collect::<Vec<_>>())
+                })?);
+                if cacheable {
+                    self.gpu_filter_candidates.lock().insert(
+                        filter.clone(),
+                        candidates.clone(),
+                        payload_epoch,
+                    );
+                }
+                candidates
+            };
+            (
+                candidates,
+                predicate_started.elapsed().as_nanos() as u64,
+                cache_hit,
+            )
+        };
+
+        #[cfg(not(feature = "gpu"))]
+        let filtered_points = Arc::new(payload_index.with_view(|v| {
             let query_cardinality = v.estimate_cardinality(filter, hw_counter)?;
             v.iter_filtered_points(
                 filter,
                 &query_cardinality,
                 hw_counter,
                 is_stopped,
-                // No deferred filtering here since it's HNSW index.
                 DeferredBehavior::IncludeAll,
             )
-            .map(|it| it.collect())
-        })?;
-        #[cfg(feature = "gpu")]
-        let predicate_ns = predicate_started.elapsed().as_nanos() as u64;
+            .map(|it| it.collect::<Vec<_>>())
+        })?);
+
         #[cfg(feature = "gpu")]
         match self.search_plain_gpu_exact(
             vectors,
@@ -463,6 +527,7 @@ impl HNSWIndex {
             params,
             vector_query_context,
             predicate_ns,
+            filter_cache_hit,
         ) {
             Ok(Some(results)) => return Ok(results),
             Ok(None) => {}
@@ -473,7 +538,7 @@ impl HNSWIndex {
 
         self.search_plain_batched(
             vectors,
-            filtered_points.into_iter(),
+            filtered_points.iter().copied(),
             top,
             params,
             vector_query_context,
