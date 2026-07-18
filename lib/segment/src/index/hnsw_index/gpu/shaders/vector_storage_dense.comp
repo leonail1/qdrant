@@ -43,6 +43,10 @@
 #include "vector_storage_bq.comp"
 #endif
 
+#ifndef VECTOR_STORAGE_QUERY_ELEMENT
+#define VECTOR_STORAGE_QUERY_ELEMENT(value) (value)
+#endif
+
 #define VECTOR_STORAGE_DEFINE(STORAGE_INDEX) \
     layout(set = VECTOR_STORAGE_LAYOUT_SET, binding = STORAGE_INDEX) \
     readonly buffer CONCAT(Vectors, STORAGE_INDEX) { \

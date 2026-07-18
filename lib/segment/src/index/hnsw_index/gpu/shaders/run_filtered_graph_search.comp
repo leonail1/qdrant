@@ -45,12 +45,12 @@ layout(set = 0, binding = 4) readonly buffer SearchRequestBuffer {
 
 void load_query_target() {
 #ifdef SINGLE_SUBGROUP_PER_VECTOR
-    target_cache = query_vector.data[gl_SubgroupInvocationID];
+    target_cache = VECTOR_STORAGE_QUERY_ELEMENT(query_vector.data[gl_SubgroupInvocationID]);
 #else
     for (uint i = 0; i < SUBGROUPS_COUNT_PER_VECTOR; i++) {
-        target_cache[i] = query_vector.data[
-            i * SUBGROUP_SIZE + gl_SubgroupInvocationID
-        ];
+        target_cache[i] = VECTOR_STORAGE_QUERY_ELEMENT(
+            query_vector.data[i * SUBGROUP_SIZE + gl_SubgroupInvocationID]
+        );
     }
 #endif
 }

@@ -1641,6 +1641,31 @@ mod tests {
     }
 
     #[test]
+    fn exact_filtered_gpu_half_precision_shaders_compile() {
+        const DIM: usize = 128;
+        const COUNT: usize = 32;
+
+        let mut storage = new_volatile_dense_vector_storage(DIM, Distance::Euclid);
+        let counter = HardwareCounterCell::new();
+        for idx in 0..COUNT {
+            let vector = (0..DIM)
+                .map(|column| ((idx * 17 + column * 13) % 251) as f32 / 251.0)
+                .collect::<Vec<_>>();
+            storage
+                .insert_vector(idx as PointOffsetType, vector.as_slice().into(), &counter)
+                .unwrap();
+        }
+
+        let instance = gpu::Instance::builder().build().unwrap();
+        let device = gpu::Device::new(instance.clone(), &instance.physical_devices()[0]).unwrap();
+        let stopped = AtomicBool::new(false);
+        let gpu_storage =
+            Arc::new(GpuVectorStorage::new(device, &storage, None, true, &stopped).unwrap());
+        assert_eq!(gpu_storage.resident_vector_bytes(), COUNT * DIM * 2);
+        GpuExactSearchCache::new_with_vector_storage(gpu_storage, COUNT, 1, 1, 0).unwrap();
+    }
+
+    #[test]
     fn exact_filtered_gpu_matches_cpu_l2() {
         const DIM: usize = 128;
         const COUNT: usize = 1_024;

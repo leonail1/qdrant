@@ -624,6 +624,32 @@ mod tests {
     use crate::vector_storage::VectorStorageRead;
 
     #[test]
+    fn filtered_graph_gpu_half_precision_shader_compiles() {
+        const COUNT: usize = 128;
+        const DIM: usize = 64;
+        const EF: usize = 32;
+
+        let test = create_gpu_graph_test_data(COUNT, DIM, HnswM::new2(8), EF, 1);
+        let instance = gpu::Instance::builder().build().unwrap();
+        let device = gpu::Device::new(instance.clone(), &instance.physical_devices()[0]).unwrap();
+        let stopped = AtomicBool::new(false);
+        let gpu_storage = Arc::new(
+            GpuVectorStorage::new(device.clone(), &test.vector_storage, None, true, &stopped)
+                .unwrap(),
+        );
+        assert!(gpu_storage.resident_vector_bytes() > 0);
+        GpuFilteredGraphSearchContext::new(
+            device,
+            gpu_storage,
+            &test.graph_layers_builder,
+            COUNT,
+            EF,
+            &stopped,
+        )
+        .unwrap();
+    }
+
+    #[test]
     fn filtered_graph_gpu_matches_cpu_level_zero_with_visibility() {
         const COUNT: usize = 1_024;
         const DIM: usize = 64;

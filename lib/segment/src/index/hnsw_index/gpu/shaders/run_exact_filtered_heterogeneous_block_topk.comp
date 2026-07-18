@@ -43,13 +43,15 @@ void load_query_target() {
     uint query_index = gl_WorkGroupID.y;
 #ifdef SINGLE_SUBGROUP_PER_VECTOR
     uint query_offset = query_index * SUBGROUP_SIZE;
-    target_cache = query_vector.data[query_offset + gl_SubgroupInvocationID];
+    target_cache = VECTOR_STORAGE_QUERY_ELEMENT(
+        query_vector.data[query_offset + gl_SubgroupInvocationID]
+    );
 #else
     uint query_offset = query_index * SUBGROUPS_COUNT_PER_VECTOR * SUBGROUP_SIZE;
     for (uint i = 0; i < SUBGROUPS_COUNT_PER_VECTOR; i++) {
-        target_cache[i] = query_vector.data[
-            query_offset + i * SUBGROUP_SIZE + gl_SubgroupInvocationID
-        ];
+        target_cache[i] = VECTOR_STORAGE_QUERY_ELEMENT(
+            query_vector.data[query_offset + i * SUBGROUP_SIZE + gl_SubgroupInvocationID]
+        );
     }
 #endif
 }
