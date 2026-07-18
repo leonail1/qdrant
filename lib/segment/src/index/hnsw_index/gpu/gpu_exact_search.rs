@@ -10,6 +10,9 @@ use common::types::{PointOffsetType, ScoredPointOffset};
 use parking_lot::{Condvar, Mutex};
 
 use super::GPU_TIMEOUT;
+use super::gpu_heterogeneous_exact_batch::{
+    GpuHeterogeneousExactBatchContext, HeterogeneousExactRequest, HeterogeneousExactTimings,
+};
 use super::gpu_vector_storage::GpuVectorStorage;
 use super::shader_builder::ShaderBuilder;
 use crate::common::operation_error::{OperationError, OperationResult};
@@ -22,6 +25,7 @@ const BLOCK_TOPK_MIN_CANDIDATES: usize = 65_536;
 const BLOCK_TOPK_LIMIT: usize = 16;
 const BLOCK_TOPK_TILE_CANDIDATES: usize = 128;
 pub const GPU_EXACT_SUBMISSION_BATCH_LIMIT: usize = 4;
+const GPU_EXACT_HETEROGENEOUS_BATCH_LIMIT: usize = 32;
 
 #[derive(Clone, Copy)]
 pub struct GpuVisibilitySnapshot<'a> {
@@ -128,6 +132,8 @@ struct GpuExactSearchStats {
     coalesced_batches: AtomicU64,
     coalesced_queries: AtomicU64,
     coalescing_wait_ns: AtomicU64,
+    heterogeneous_batches: AtomicU64,
+    heterogeneous_queries: AtomicU64,
 }
 
 impl GpuExactSearchStats {
@@ -276,6 +282,13 @@ impl GpuExactSearchStats {
         } else {
             coalescing_wait_ns as f64 / coalesced_batches as f64 / 1_000.0
         };
+        let heterogeneous_batches = take(&self.heterogeneous_batches);
+        let heterogeneous_queries = take(&self.heterogeneous_queries);
+        let average_heterogeneous_batch = if heterogeneous_batches == 0 {
+            0.0
+        } else {
+            heterogeneous_queries as f64 / heterogeneous_batches as f64
+        };
         let average_us = |value: u64| value as f64 / queries as f64 / 1_000.0;
 
         log::info!(
@@ -292,7 +305,10 @@ impl GpuExactSearchStats {
              average_submission_batch={average_submission_batch:.3}, \
              coalesced_batches={coalesced_batches}, coalesced_queries={coalesced_queries}, \
              average_coalesced_batch={average_coalesced_batch:.3}, \
-             average_coalescing_wait_us={average_coalescing_wait_us:.3}",
+             average_coalescing_wait_us={average_coalescing_wait_us:.3}, \
+             heterogeneous_batches={heterogeneous_batches}, \
+             heterogeneous_queries={heterogeneous_queries}, \
+             average_heterogeneous_batch={average_heterogeneous_batch:.3}",
             candidates as f64 / queries as f64,
             average_us(predicate_ns),
             average_us(visibility_ns),
@@ -312,6 +328,22 @@ impl GpuExactSearchStats {
             resident_candidate_hit_rate,
             resident_visibility_hit_rate,
         );
+    }
+
+    fn record_heterogeneous_inner(&self, query_count: usize, timings: HeterogeneousExactTimings) {
+        Self::add(&self.candidates, timings.total_candidates as u64);
+        Self::add(&self.prepare_ns, timings.prepare_ns);
+        Self::add(&self.command_record_ns, timings.command_record_ns);
+        Self::add(&self.queue_submit_ns, timings.queue_submit_ns);
+        Self::add(&self.fence_wait_ns, timings.fence_wait_ns);
+        Self::add(&self.download_ns, timings.download_ns);
+        Self::add(&self.cpu_topk_ns, timings.cpu_topk_ns);
+        Self::add(&self.submission_batches, 1);
+        Self::add(&self.submission_queries, query_count as u64);
+        Self::add(&self.coalesced_batches, 1);
+        Self::add(&self.coalesced_queries, query_count as u64);
+        Self::add(&self.heterogeneous_batches, 1);
+        Self::add(&self.heterogeneous_queries, query_count as u64);
     }
 }
 
@@ -818,12 +850,39 @@ struct GpuSubmissionBatchState {
     pending: HashMap<GpuSubmissionBatchKey, VecDeque<PendingGpuSubmission>>,
 }
 
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+struct GpuHeterogeneousBatchKey {
+    visibility_buffer: usize,
+    top: usize,
+}
+
+struct PendingHeterogeneousQuery {
+    query: Vec<f32>,
+    candidates: Arc<Vec<PointOffsetType>>,
+    response: SyncSender<GpuSubmissionResponse>,
+}
+
+struct PendingHeterogeneousSubmission {
+    id: u64,
+    visibility_buffer: Option<Arc<gpu::Buffer>>,
+    queries: Vec<PendingHeterogeneousQuery>,
+}
+
+#[derive(Default)]
+struct GpuHeterogeneousBatchState {
+    next_id: u64,
+    pending: HashMap<GpuHeterogeneousBatchKey, VecDeque<PendingHeterogeneousSubmission>>,
+}
+
 pub struct GpuExactSearchCache {
     contexts: Mutex<Vec<GpuExactSearchContext>>,
+    heterogeneous_context: Option<Mutex<GpuHeterogeneousExactBatchContext>>,
     resident_candidates: Mutex<GpuResidentCandidateCache>,
     resident_visibility: Mutex<GpuResidentVisibilityCache>,
     submission_batches: Mutex<GpuSubmissionBatchState>,
     submission_ready: Condvar,
+    heterogeneous_batches: Mutex<GpuHeterogeneousBatchState>,
+    heterogeneous_ready: Condvar,
     candidate_capacity: usize,
     context_count: usize,
     batch_max_queries: usize,
@@ -839,6 +898,13 @@ impl fmt::Debug for GpuExactSearchCache {
             .field("context_count", &self.context_count)
             .field("batch_max_queries", &self.batch_max_queries)
             .field("batch_window", &self.batch_window)
+            .field(
+                "heterogeneous_resident_device_bytes",
+                &self
+                    .heterogeneous_context
+                    .as_ref()
+                    .map(|context| context.lock().resident_device_bytes()),
+            )
             .finish_non_exhaustive()
     }
 }
@@ -991,6 +1057,155 @@ impl GpuExactSearchCache {
         }
     }
 
+    fn lead_heterogeneous_submission(&self, key: GpuHeterogeneousBatchKey, batch_id: u64) {
+        let wait_started = std::time::Instant::now();
+        let submission = {
+            let mut state = self.heterogeneous_batches.lock();
+            loop {
+                let query_count = state
+                    .pending
+                    .get(&key)
+                    .and_then(|batches| batches.iter().find(|batch| batch.id == batch_id))
+                    .map(|batch| batch.queries.len())
+                    .expect("GPU heterogeneous leader lost its pending batch");
+                let elapsed = wait_started.elapsed();
+                if query_count >= self.batch_max_queries || elapsed >= self.batch_window {
+                    break;
+                }
+                self.heterogeneous_ready
+                    .wait_for(&mut state, self.batch_window - elapsed);
+            }
+
+            let (submission, remove_key) = {
+                let batches = state
+                    .pending
+                    .get_mut(&key)
+                    .expect("GPU heterogeneous batch key disappeared");
+                let position = batches
+                    .iter()
+                    .position(|batch| batch.id == batch_id)
+                    .expect("GPU heterogeneous batch ID disappeared");
+                let submission = batches
+                    .remove(position)
+                    .expect("GPU heterogeneous batch removal failed");
+                (submission, batches.is_empty())
+            };
+            if remove_key {
+                state.pending.remove(&key);
+            }
+            submission
+        };
+
+        GpuExactSearchStats::add(
+            &self.stats.coalescing_wait_ns,
+            wait_started.elapsed().as_nanos() as u64,
+        );
+        let result = if let Some(context) = &self.heterogeneous_context {
+            let requests = submission
+                .queries
+                .iter()
+                .map(|query| HeterogeneousExactRequest {
+                    query: query.query.as_slice(),
+                    candidates: query.candidates.as_slice(),
+                })
+                .collect::<Vec<_>>();
+            context
+                .lock()
+                .search(requests.as_slice(), key.top, submission.visibility_buffer)
+        } else {
+            Err(OperationError::service_error(
+                "GPU heterogeneous batch context is unavailable",
+            ))
+        };
+
+        match result {
+            Ok((results, timings)) if results.len() == submission.queries.len() => {
+                self.stats
+                    .record_heterogeneous_inner(submission.queries.len(), timings);
+                for (query, result) in submission.queries.into_iter().zip(results) {
+                    let _ = query.response.send(Ok(Some(result)));
+                }
+            }
+            Ok((results, _)) => {
+                let message = format!(
+                    "GPU heterogeneous exact batch returned {} results for {} queries",
+                    results.len(),
+                    submission.queries.len(),
+                );
+                for query in submission.queries {
+                    let _ = query
+                        .response
+                        .send(Err(OperationError::service_error(message.clone())));
+                }
+            }
+            Err(error) => {
+                let message = format!("GPU heterogeneous exact submission failed: {error}");
+                for query in submission.queries {
+                    let _ = query
+                        .response
+                        .send(Err(OperationError::service_error(message.clone())));
+                }
+            }
+        }
+    }
+
+    fn search_heterogeneous_coalesced(
+        &self,
+        query: &[f32],
+        candidates: Arc<Vec<PointOffsetType>>,
+        top: usize,
+        visibility_buffer: Option<Arc<gpu::Buffer>>,
+    ) -> OperationResult<Option<Vec<ScoredPointOffset>>> {
+        let key = GpuHeterogeneousBatchKey {
+            visibility_buffer: visibility_buffer
+                .as_ref()
+                .map_or(0, |buffer| Arc::as_ptr(buffer) as usize),
+            top,
+        };
+        let (sender, receiver) = sync_channel(1);
+        let mut pending_query = Some(PendingHeterogeneousQuery {
+            query: query.to_vec(),
+            candidates,
+            response: sender,
+        });
+        let (batch_id, is_leader) =
+            {
+                let mut state = self.heterogeneous_batches.lock();
+                if let Some(batch) = state
+                    .pending
+                    .get_mut(&key)
+                    .and_then(|batches| batches.back_mut())
+                    .filter(|batch| batch.queries.len() < self.batch_max_queries)
+                {
+                    batch
+                        .queries
+                        .push(pending_query.take().expect("pending GPU query missing"));
+                    self.heterogeneous_ready.notify_all();
+                    (batch.id, false)
+                } else {
+                    state.next_id = state.next_id.wrapping_add(1).max(1);
+                    let batch_id = state.next_id;
+                    state.pending.entry(key).or_default().push_back(
+                        PendingHeterogeneousSubmission {
+                            id: batch_id,
+                            visibility_buffer,
+                            queries: vec![pending_query.take().expect("pending GPU query missing")],
+                        },
+                    );
+                    (batch_id, true)
+                }
+            };
+
+        if is_leader {
+            self.lead_heterogeneous_submission(key, batch_id);
+        }
+        receiver.recv().map_err(|error| {
+            OperationError::service_error(format!(
+                "GPU heterogeneous response channel closed: {error}",
+            ))
+        })?
+    }
+
     pub fn search_coalesced(
         &self,
         query: &[f32],
@@ -1032,6 +1247,10 @@ impl GpuExactSearchCache {
         let resident_visibility_ns = resident_visibility_started.elapsed().as_nanos() as u64;
         if visibility.is_some() && visibility_buffer.is_none() {
             return self.search(query, candidates, top, reuse_candidate_buffer, visibility);
+        }
+
+        if self.heterogeneous_context.is_some() {
+            return self.search_heterogeneous_coalesced(query, candidates, top, visibility_buffer);
         }
 
         let key = GpuSubmissionBatchKey {
@@ -1107,7 +1326,7 @@ impl GpuExactSearchCache {
         if candidate_capacity == 0
             || context_count == 0
             || batch_max_queries == 0
-            || batch_max_queries > GPU_EXACT_SUBMISSION_BATCH_LIMIT
+            || batch_max_queries > GPU_EXACT_HETEROGENEOUS_BATCH_LIMIT
         {
             return Err(OperationError::service_error(
                 "GPU exact capacities must be positive",
@@ -1126,6 +1345,32 @@ impl GpuExactSearchCache {
             false,
             stopped,
         )?);
+        Self::new_with_vector_storage(
+            vector_storage,
+            candidate_capacity,
+            context_count,
+            batch_max_queries,
+            batch_window_us,
+        )
+    }
+
+    pub fn new_with_vector_storage(
+        vector_storage: Arc<GpuVectorStorage>,
+        candidate_capacity: usize,
+        context_count: usize,
+        batch_max_queries: usize,
+        batch_window_us: usize,
+    ) -> OperationResult<Self> {
+        if candidate_capacity == 0
+            || context_count == 0
+            || batch_max_queries == 0
+            || batch_max_queries > GPU_EXACT_HETEROGENEOUS_BATCH_LIMIT
+        {
+            return Err(OperationError::service_error(
+                "GPU exact capacities must be positive",
+            ));
+        }
+        let device = vector_storage.device();
         let descriptor_set_layout = gpu::DescriptorSetLayout::builder()
             .add_storage_buffer(0)
             .add_storage_buffer(1)
@@ -1195,13 +1440,34 @@ impl GpuExactSearchCache {
                 )
             })
             .collect::<OperationResult<Vec<_>>>()?;
+        let heterogeneous_context = if batch_max_queries > 1 && batch_window_us > 0 {
+            match GpuHeterogeneousExactBatchContext::new(
+                vector_storage,
+                candidate_capacity,
+                batch_max_queries,
+                context_count,
+            ) {
+                Ok(context) => Some(Mutex::new(context)),
+                Err(error) => {
+                    log::warn!(
+                        "Heterogeneous GPU exact batching disabled by capacity gate: {error}"
+                    );
+                    None
+                }
+            }
+        } else {
+            None
+        };
 
         Ok(Self {
             contexts: Mutex::new(contexts),
+            heterogeneous_context,
             resident_candidates: Mutex::new(GpuResidentCandidateCache::default()),
             resident_visibility: Mutex::new(GpuResidentVisibilityCache::default()),
             submission_batches: Mutex::new(GpuSubmissionBatchState::default()),
             submission_ready: Condvar::new(),
+            heterogeneous_batches: Mutex::new(GpuHeterogeneousBatchState::default()),
+            heterogeneous_ready: Condvar::new(),
             candidate_capacity,
             context_count,
             batch_max_queries,
@@ -1711,6 +1977,85 @@ mod tests {
         assert_eq!(cache.stats.coalesced_batches.load(Ordering::Relaxed), 1);
         assert_eq!(
             cache.stats.coalesced_queries.load(Ordering::Relaxed),
+            GPU_EXACT_SUBMISSION_BATCH_LIMIT as u64,
+        );
+
+        let heterogeneous_candidates = (0..GPU_EXACT_SUBMISSION_BATCH_LIMIT)
+            .map(|candidate_index| {
+                let mut points = (0..COUNT as PointOffsetType).collect::<Vec<_>>();
+                points.rotate_left(candidate_index * 997);
+                Arc::new(points)
+            })
+            .collect::<Vec<_>>();
+        for candidates in &heterogeneous_candidates {
+            cache
+                .search(
+                    query.as_slice(),
+                    candidates.clone(),
+                    TOP,
+                    true,
+                    Some(GpuVisibilitySnapshot {
+                        generation: 12,
+                        deleted: deleted.as_bitslice(),
+                        point_count: COUNT,
+                    }),
+                )
+                .unwrap()
+                .unwrap();
+        }
+        let heterogeneous_before = cache.stats.heterogeneous_queries.load(Ordering::Relaxed);
+        let barrier = Arc::new(std::sync::Barrier::new(
+            GPU_EXACT_SUBMISSION_BATCH_LIMIT + 1,
+        ));
+        let threads = heterogeneous_candidates
+            .into_iter()
+            .enumerate()
+            .map(|(query_index, candidates)| {
+                let cache = cache.clone();
+                let deleted = deleted.clone();
+                let query = if query_index.is_multiple_of(2) {
+                    query.clone()
+                } else {
+                    query_two.clone()
+                };
+                let barrier = barrier.clone();
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    cache
+                        .search_coalesced(
+                            query.as_slice(),
+                            candidates,
+                            TOP,
+                            true,
+                            Some(GpuVisibilitySnapshot {
+                                generation: 12,
+                                deleted: deleted.as_bitslice(),
+                                point_count: COUNT,
+                            }),
+                        )
+                        .unwrap()
+                        .unwrap()
+                })
+            })
+            .collect::<Vec<_>>();
+        barrier.wait();
+        let heterogeneous_results = threads
+            .into_iter()
+            .map(|thread| thread.join().unwrap())
+            .collect::<Vec<_>>();
+        for (query_index, result) in heterogeneous_results.iter().enumerate() {
+            let expected = if query_index.is_multiple_of(2) {
+                &visible_expected
+            } else {
+                &visible_expected_two
+            };
+            for (actual, expected) in result.iter().zip(expected[..TOP].iter().copied()) {
+                assert_eq!(actual.idx, expected.idx);
+                assert!((actual.score - expected.score).abs() < 1e-4);
+            }
+        }
+        assert_eq!(
+            cache.stats.heterogeneous_queries.load(Ordering::Relaxed) - heterogeneous_before,
             GPU_EXACT_SUBMISSION_BATCH_LIMIT as u64,
         );
     }

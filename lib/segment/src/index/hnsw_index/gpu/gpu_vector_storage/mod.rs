@@ -41,12 +41,26 @@ pub struct GpuVectorStorage {
     descriptor_set_layout: Arc<gpu::DescriptorSetLayout>,
     descriptor_set: Arc<gpu::DescriptorSet>,
     dim: usize,
+    resident_vector_bytes: usize,
     element_type: VectorStorageDatatype,
     distance: Distance,
     /// Additional quantization data.
     quantization: Option<GpuQuantization>,
     /// Additional multivectors data.
     multivectors: Option<GpuMultivectors>,
+}
+
+impl std::fmt::Debug for GpuVectorStorage {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("GpuVectorStorage")
+            .field("num_vectors", &self.num_vectors)
+            .field("dim", &self.dim)
+            .field("resident_vector_bytes", &self.resident_vector_bytes)
+            .field("element_type", &self.element_type)
+            .field("distance", &self.distance)
+            .finish_non_exhaustive()
+    }
 }
 
 impl ShaderBuilderParameters for GpuVectorStorage {
@@ -671,6 +685,8 @@ impl GpuVectorStorage {
         let upload_points_count = UPLOAD_CHUNK_SIZE / gpu_vector_size;
 
         let points_in_storage_count = Self::points_in_storage_count(dense_count);
+        let resident_vector_bytes =
+            STORAGES_COUNT * std::cmp::max(points_in_storage_count, 1) * gpu_vector_size;
         let vectors_buffer: Vec<Arc<gpu::Buffer>> = (0..STORAGES_COUNT)
             .map(|_| -> gpu::GpuResult<Arc<gpu::Buffer>> {
                 gpu::Buffer::new(
@@ -784,6 +800,7 @@ impl GpuVectorStorage {
             descriptor_set_layout,
             descriptor_set,
             dim: gpu_vector_capacity,
+            resident_vector_bytes,
             num_vectors,
             element_type: TElement::datatype(),
             distance,
@@ -871,6 +888,13 @@ impl GpuVectorStorage {
 
     pub fn dim(&self) -> usize {
         self.dim
+    }
+
+    /// Bytes occupied by the primary resident vector buffers. Auxiliary
+    /// quantization and multivector metadata are intentionally reported
+    /// separately by their owners.
+    pub fn resident_vector_bytes(&self) -> usize {
+        self.resident_vector_bytes
     }
 
     pub fn vector_capacity(&self) -> usize {

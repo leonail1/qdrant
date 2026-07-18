@@ -51,6 +51,49 @@ use crate::vector_storage::check_deleted_condition;
 
 impl HNSWIndex {
     #[cfg(feature = "gpu")]
+    fn gpu_vector_storage_cache(
+        &self,
+        vector_storage: &VectorStorageEnum,
+        is_stopped: &std::sync::atomic::AtomicBool,
+    ) -> Option<&std::sync::Arc<GpuVectorStorage>> {
+        self.gpu_vector_storage
+            .get_or_init(|| {
+                let create = || -> OperationResult<Option<std::sync::Arc<GpuVectorStorage>>> {
+                    let manager = GPU_DEVICES_MANAGER.read();
+                    let Some(manager) = manager.as_ref() else {
+                        return Ok(None);
+                    };
+                    let Some(device) = manager.lock_device(is_stopped)? else {
+                        return Ok(None);
+                    };
+                    let gpu_vectors = std::sync::Arc::new(GpuVectorStorage::new(
+                        device.device(),
+                        vector_storage,
+                        None,
+                        false,
+                        is_stopped,
+                    )?);
+                    log::info!(
+                        "Initialized shared GPU vector storage: points={}, aligned_dim={}, resident_vector_bytes={}",
+                        gpu_vectors.num_vectors(),
+                        gpu_vectors.dim(),
+                        gpu_vectors.resident_vector_bytes(),
+                    );
+                    Ok(Some(gpu_vectors))
+                };
+
+                match create() {
+                    Ok(storage) => storage,
+                    Err(error) => {
+                        log::warn!("Failed to initialize shared GPU vector storage: {error}");
+                        None
+                    }
+                }
+            })
+            .as_ref()
+    }
+
+    #[cfg(feature = "gpu")]
     fn gpu_filtered_graph_search_cache(
         &self,
         vector_storage: &VectorStorageEnum,
@@ -66,23 +109,14 @@ impl HNSWIndex {
             .get_or_init(|| {
                 let create =
                     || -> OperationResult<Option<std::sync::Arc<GpuFilteredGraphSearchCache>>> {
-                        let manager = GPU_DEVICES_MANAGER.read();
-                        let Some(manager) = manager.as_ref() else {
+                        let Some(gpu_vectors) =
+                            self.gpu_vector_storage_cache(vector_storage, is_stopped)
+                        else {
                             return Ok(None);
                         };
-                        let Some(device) = manager.lock_device(is_stopped)? else {
-                            return Ok(None);
-                        };
-                        let gpu_vectors = std::sync::Arc::new(GpuVectorStorage::new(
-                            device.device(),
-                            vector_storage,
-                            None,
-                            false,
-                            is_stopped,
-                        )?);
                         let cache = GpuFilteredGraphSearchCache::new(
-                            device.device(),
-                            gpu_vectors,
+                            gpu_vectors.device(),
+                            gpu_vectors.clone(),
                             &self.graph,
                             vector_storage.total_vector_count(),
                             ef,
@@ -123,21 +157,17 @@ impl HNSWIndex {
         self.gpu_exact_search
             .get_or_init(|| {
                 let create = || -> OperationResult<Option<std::sync::Arc<GpuExactSearchCache>>> {
-                    let manager = GPU_DEVICES_MANAGER.read();
-                    let Some(manager) = manager.as_ref() else {
+                    let Some(gpu_vectors) =
+                        self.gpu_vector_storage_cache(vector_storage, is_stopped)
+                    else {
                         return Ok(None);
                     };
-                    let Some(device) = manager.lock_device(is_stopped)? else {
-                        return Ok(None);
-                    };
-                    let cache = GpuExactSearchCache::new(
-                        device.device(),
-                        vector_storage,
+                    let cache = GpuExactSearchCache::new_with_vector_storage(
+                        gpu_vectors.clone(),
                         config.max_candidates,
                         config.contexts,
                         config.batch_max_queries,
                         config.batch_window_us,
-                        is_stopped,
                     )?;
                     Ok(Some(std::sync::Arc::new(cache)))
                 };

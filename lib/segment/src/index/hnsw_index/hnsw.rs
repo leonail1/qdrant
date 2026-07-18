@@ -19,6 +19,8 @@ use crate::index::hnsw_index::gpu::gpu_exact_search::{
 };
 #[cfg(feature = "gpu")]
 use crate::index::hnsw_index::gpu::gpu_filtered_graph_search::GpuFilteredGraphSearchCache;
+#[cfg(feature = "gpu")]
+use crate::index::hnsw_index::gpu::gpu_vector_storage::GpuVectorStorage;
 use crate::index::hnsw_index::graph_layers::{GraphLayers, LoadOption};
 use crate::index::struct_payload_index::StructPayloadIndex;
 use crate::types::HnswConfig;
@@ -56,6 +58,8 @@ pub struct HNSWIndex {
     graph: GraphLayers,
     searches_telemetry: HNSWSearchesTelemetry,
     is_on_disk: bool,
+    #[cfg(feature = "gpu")]
+    gpu_vector_storage: OnceLock<Option<Arc<GpuVectorStorage>>>,
     #[cfg(feature = "gpu")]
     gpu_exact_search: OnceLock<Option<Arc<GpuExactSearchCache>>>,
     #[cfg(feature = "gpu")]
@@ -135,6 +139,8 @@ impl HNSWIndex {
             searches_telemetry: HNSWSearchesTelemetry::new(),
             is_on_disk,
             #[cfg(feature = "gpu")]
+            gpu_vector_storage: OnceLock::new(),
+            #[cfg(feature = "gpu")]
             gpu_exact_search: OnceLock::new(),
             #[cfg(feature = "gpu")]
             gpu_filtered_graph_search: OnceLock::new(),
@@ -173,6 +179,8 @@ impl HNSWIndex {
             graph,
             searches_telemetry: _,
             is_on_disk: _,
+            #[cfg(feature = "gpu")]
+                gpu_vector_storage: _,
             #[cfg(feature = "gpu")]
             gpu_exact_search,
             #[cfg(feature = "gpu")]

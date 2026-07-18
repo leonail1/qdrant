@@ -1,0 +1,216 @@
+#version 450
+
+#include "extensions.comp"
+#include "common.comp"
+
+#define TILE_CANDIDATES 128
+#define BLOCK_SUBGROUPS (TILE_CANDIDATES / SUBGROUP_SIZE)
+#define CANDIDATES_PER_SUBGROUP SUBGROUP_SIZE
+#define BLOCK_TOPK 16
+
+layout(local_size_x = TILE_CANDIDATES, local_size_y = 1, local_size_z = 1) in;
+
+#define VECTOR_STORAGE_LAYOUT_SET 1
+#include "vector_storage.comp"
+
+layout(set = 0, binding = 0) readonly buffer CandidateIds {
+    uint data[];
+} candidate_ids;
+
+layout(set = 0, binding = 1) readonly buffer QueryVector {
+    vec4 data[];
+} query_vector;
+
+layout(set = 0, binding = 2) writeonly buffer BlockResults {
+    ScoredPoint data[];
+} block_results;
+
+// Per query: candidate offset, candidate count, output offset, reserved.
+layout(set = 0, binding = 3) readonly buffer QueryMetadata {
+    uvec4 data[];
+} query_metadata;
+
+// LSB-first words: bit 1 means the base ordinal is invisible. A zero-filled
+// buffer is bound for immutable snapshots, keeping the dispatch shape common.
+layout(set = 0, binding = 4) readonly buffer DeletedWords {
+    uint data[];
+} deleted_words;
+
+shared float tile_scores[TILE_CANDIDATES];
+shared uint tile_candidate_indices[TILE_CANDIDATES];
+
+void load_query_target() {
+    uint query_index = gl_WorkGroupID.y;
+#ifdef SINGLE_SUBGROUP_PER_VECTOR
+    uint query_offset = query_index * SUBGROUP_SIZE;
+    target_cache = query_vector.data[query_offset + gl_SubgroupInvocationID];
+#else
+    uint query_offset = query_index * SUBGROUPS_COUNT_PER_VECTOR * SUBGROUP_SIZE;
+    for (uint i = 0; i < SUBGROUPS_COUNT_PER_VECTOR; i++) {
+        target_cache[i] = query_vector.data[
+            query_offset + i * SUBGROUP_SIZE + gl_SubgroupInvocationID
+        ];
+    }
+#endif
+}
+
+void subgroup_sort_ascending(inout float score, inout uint candidate_index) {
+    uint lane = gl_SubgroupInvocationID;
+    for (uint sequence = 2; sequence <= SUBGROUP_SIZE; sequence <<= 1) {
+        for (uint stride = sequence >> 1; stride > 0; stride >>= 1) {
+            float peer_score = subgroupShuffleXor(score, stride);
+            uint peer_index = subgroupShuffleXor(candidate_index, stride);
+            bool ascending = (lane & sequence) == 0;
+            bool lower_lane = (lane & stride) == 0;
+            bool take_peer = ascending == lower_lane
+                ? peer_score < score
+                : peer_score > score;
+            if (take_peer) {
+                score = peer_score;
+                candidate_index = peer_index;
+            }
+        }
+    }
+}
+
+bool is_visible(uint point_id) {
+    uint word = point_id >> 5;
+    return word < deleted_words.data.length()
+        && ((deleted_words.data[word] >> (point_id & 31)) & 1u) == 0u;
+}
+
+void write_block_result(
+    uint output_lane,
+    uint candidate_index,
+    float score,
+    uvec4 metadata
+) {
+    ScoredPoint result;
+    result.id = candidate_index == INVALID_POINT_ID
+        ? INVALID_POINT_ID
+        : candidate_ids.data[metadata.x + candidate_index];
+    result.score = score;
+    uint output_index = metadata.z
+        + (gl_WorkGroupID.x * BLOCK_TOPK)
+        + output_lane;
+    block_results.data[output_index] = result;
+}
+
+void main() {
+    uint query_index = gl_WorkGroupID.y;
+    uvec4 metadata = query_metadata.data[query_index];
+    uint block_count = (metadata.y + TILE_CANDIDATES - 1) / TILE_CANDIDATES;
+    if (gl_WorkGroupID.x >= block_count) {
+        return;
+    }
+
+    uint subgroup_in_block = gl_SubgroupID;
+    uint block_start = gl_WorkGroupID.x * TILE_CANDIDATES;
+    uint subgroup_lane = gl_SubgroupInvocationID;
+    float own_score = negative_infinity;
+    uint own_candidate_index = INVALID_POINT_ID;
+
+    load_query_target();
+    for (uint iteration = 0; iteration < CANDIDATES_PER_SUBGROUP; iteration++) {
+        uint tile_index = iteration * BLOCK_SUBGROUPS + subgroup_in_block;
+        uint candidate_index = block_start + tile_index;
+        uint point_id = candidate_index < metadata.y
+            ? candidate_ids.data[metadata.x + candidate_index]
+            : INVALID_POINT_ID;
+        bool visible = point_id != INVALID_POINT_ID && is_visible(point_id);
+        float score = negative_infinity;
+        if (visible) {
+            score = similarity(point_id);
+        }
+        if (subgroup_lane == iteration) {
+            own_score = score;
+            own_candidate_index = visible ? candidate_index : INVALID_POINT_ID;
+        }
+    }
+
+#if SUBGROUP_SIZE < 32
+    uint lane = gl_LocalInvocationID.x;
+    tile_scores[lane] = own_score;
+    tile_candidate_indices[lane] = own_candidate_index;
+    barrier();
+    for (uint sequence = 2; sequence <= TILE_CANDIDATES; sequence <<= 1) {
+        for (uint stride = sequence >> 1; stride > 0; stride >>= 1) {
+            uint peer = lane ^ stride;
+            if (peer > lane) {
+                float own_value = tile_scores[lane];
+                float peer_value = tile_scores[peer];
+                bool ascending = (lane & sequence) == 0;
+                bool swap_values = ascending
+                    ? own_value > peer_value
+                    : own_value < peer_value;
+                if (swap_values) {
+                    uint own_index = tile_candidate_indices[lane];
+                    tile_scores[lane] = peer_value;
+                    tile_scores[peer] = own_value;
+                    tile_candidate_indices[lane] = tile_candidate_indices[peer];
+                    tile_candidate_indices[peer] = own_index;
+                }
+            }
+            barrier();
+        }
+    }
+    if (lane < BLOCK_TOPK) {
+        uint sorted_index = TILE_CANDIDATES - 1 - lane;
+        write_block_result(
+            lane,
+            tile_candidate_indices[sorted_index],
+            tile_scores[sorted_index],
+            metadata
+        );
+    }
+#else
+    subgroup_sort_ascending(own_score, own_candidate_index);
+    if (subgroup_lane >= SUBGROUP_SIZE - BLOCK_TOPK) {
+        uint top_lane = subgroup_lane - (SUBGROUP_SIZE - BLOCK_TOPK);
+        uint shared_index = subgroup_in_block * BLOCK_TOPK + top_lane;
+        tile_scores[shared_index] = own_score;
+        tile_candidate_indices[shared_index] = own_candidate_index;
+    }
+    barrier();
+
+#if SUBGROUP_SIZE == 32
+    if (subgroup_in_block < 2) {
+        uint shared_index = subgroup_in_block * SUBGROUP_SIZE + subgroup_lane;
+        own_score = tile_scores[shared_index];
+        own_candidate_index = tile_candidate_indices[shared_index];
+        subgroup_sort_ascending(own_score, own_candidate_index);
+        if (subgroup_lane >= SUBGROUP_SIZE - BLOCK_TOPK) {
+            uint top_lane = subgroup_lane - (SUBGROUP_SIZE - BLOCK_TOPK);
+            uint merged_index = subgroup_in_block * BLOCK_TOPK + top_lane;
+            tile_scores[merged_index] = own_score;
+            tile_candidate_indices[merged_index] = own_candidate_index;
+        }
+    }
+    barrier();
+    if (subgroup_in_block == 0) {
+        own_score = tile_scores[subgroup_lane];
+        own_candidate_index = tile_candidate_indices[subgroup_lane];
+        subgroup_sort_ascending(own_score, own_candidate_index);
+        if (subgroup_lane >= SUBGROUP_SIZE - BLOCK_TOPK) {
+            uint output_lane = SUBGROUP_SIZE - 1 - subgroup_lane;
+            write_block_result(output_lane, own_candidate_index, own_score, metadata);
+        }
+    }
+#else
+    if (subgroup_in_block == 0) {
+        uint intermediate_count = BLOCK_SUBGROUPS * BLOCK_TOPK;
+        own_score = subgroup_lane < intermediate_count
+            ? tile_scores[subgroup_lane]
+            : negative_infinity;
+        own_candidate_index = subgroup_lane < intermediate_count
+            ? tile_candidate_indices[subgroup_lane]
+            : INVALID_POINT_ID;
+        subgroup_sort_ascending(own_score, own_candidate_index);
+        if (subgroup_lane >= SUBGROUP_SIZE - BLOCK_TOPK) {
+            uint output_lane = SUBGROUP_SIZE - 1 - subgroup_lane;
+            write_block_result(output_lane, own_candidate_index, own_score, metadata);
+        }
+    }
+#endif
+#endif
+}
