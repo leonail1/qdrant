@@ -54,11 +54,6 @@ impl ShaderBuilder {
         self
     }
 
-    pub fn with_define(&mut self, name: impl Into<String>, value: Option<String>) -> &mut Self {
-        self.defines.insert(name.into(), value);
-        self
-    }
-
     pub fn build(&self, shader_name: &str) -> OperationResult<Arc<gpu::Shader>> {
         let timer = std::time::Instant::now();
         let compiled = self.device.instance().compile_shader(

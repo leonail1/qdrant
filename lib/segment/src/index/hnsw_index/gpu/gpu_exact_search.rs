@@ -128,8 +128,6 @@ struct GpuExactSearchStats {
     coalesced_batches: AtomicU64,
     coalesced_queries: AtomicU64,
     coalescing_wait_ns: AtomicU64,
-    global_topk_queries: AtomicU64,
-    global_topk_passes: AtomicU64,
 }
 
 impl GpuExactSearchStats {
@@ -153,7 +151,6 @@ impl GpuExactSearchStats {
         resident_visibility_ns: u64,
         resident_candidate_hit: Option<bool>,
         resident_visibility_hit: Option<bool>,
-        global_topk_passes: usize,
     ) {
         Self::add(
             &self.candidates,
@@ -181,10 +178,6 @@ impl GpuExactSearchStats {
         }
         Self::add(&self.submission_batches, 1);
         Self::add(&self.submission_queries, query_count as u64);
-        if global_topk_passes > 0 {
-            Self::add(&self.global_topk_queries, query_count as u64);
-            Self::add(&self.global_topk_passes, global_topk_passes as u64);
-        }
     }
 
     fn record_outer(
@@ -283,13 +276,6 @@ impl GpuExactSearchStats {
         } else {
             coalescing_wait_ns as f64 / coalesced_batches as f64 / 1_000.0
         };
-        let global_topk_queries = take(&self.global_topk_queries);
-        let global_topk_passes = take(&self.global_topk_passes);
-        let average_global_topk_passes = if global_topk_queries == 0 {
-            0.0
-        } else {
-            global_topk_passes as f64 / global_topk_queries as f64
-        };
         let average_us = |value: u64| value as f64 / queries as f64 / 1_000.0;
 
         log::info!(
@@ -306,9 +292,7 @@ impl GpuExactSearchStats {
              average_submission_batch={average_submission_batch:.3}, \
              coalesced_batches={coalesced_batches}, coalesced_queries={coalesced_queries}, \
              average_coalesced_batch={average_coalesced_batch:.3}, \
-             average_coalescing_wait_us={average_coalescing_wait_us:.3}, \
-             global_topk_queries={global_topk_queries}, \
-             average_global_topk_passes={average_global_topk_passes:.3}",
+             average_coalescing_wait_us={average_coalescing_wait_us:.3}",
             candidates as f64 / queries as f64,
             average_us(predicate_ns),
             average_us(visibility_ns),
@@ -430,8 +414,6 @@ struct GpuExactSearchContext {
     block_topk_pipeline: Arc<gpu::Pipeline>,
     visible_score_pipeline: Arc<gpu::Pipeline>,
     visible_block_topk_pipeline: Arc<gpu::Pipeline>,
-    reduction_initial_pipeline: Arc<gpu::Pipeline>,
-    reduction_pipeline: Arc<gpu::Pipeline>,
     descriptor_set: Arc<gpu::DescriptorSet>,
     descriptor_set_layout: Arc<gpu::DescriptorSetLayout>,
     visibility_descriptor_set_layout: Arc<gpu::DescriptorSetLayout>,
@@ -444,13 +426,6 @@ struct GpuExactSearchContext {
     query_staging: Arc<gpu::Buffer>,
     score_buffer: Arc<gpu::Buffer>,
     score_staging: Arc<gpu::Buffer>,
-    reduction_a: Arc<gpu::Buffer>,
-    reduction_b: Arc<gpu::Buffer>,
-    reduction_count_buffer: Arc<gpu::Buffer>,
-    reduction_count_staging: Arc<gpu::Buffer>,
-    reduction_initial_descriptor_set: Arc<gpu::DescriptorSet>,
-    reduction_forward_descriptor_set: Arc<gpu::DescriptorSet>,
-    reduction_backward_descriptor_set: Arc<gpu::DescriptorSet>,
     stats: Arc<GpuExactSearchStats>,
     candidate_capacity: usize,
     query_capacity: usize,
@@ -463,12 +438,8 @@ impl GpuExactSearchContext {
         block_topk_pipeline: Arc<gpu::Pipeline>,
         visible_score_pipeline: Arc<gpu::Pipeline>,
         visible_block_topk_pipeline: Arc<gpu::Pipeline>,
-        reduction_initial_pipeline: Arc<gpu::Pipeline>,
-        reduction_pipeline: Arc<gpu::Pipeline>,
         descriptor_set_layout: Arc<gpu::DescriptorSetLayout>,
         visibility_descriptor_set_layout: Arc<gpu::DescriptorSetLayout>,
-        reduction_initial_descriptor_set_layout: Arc<gpu::DescriptorSetLayout>,
-        reduction_descriptor_set_layout: Arc<gpu::DescriptorSetLayout>,
         candidate_capacity: usize,
         queue_index: usize,
         stats: Arc<GpuExactSearchStats>,
@@ -482,14 +453,6 @@ impl GpuExactSearchContext {
             .saturating_mul(std::mem::size_of::<ScoredPointOffset>())
             .saturating_mul(GPU_EXACT_SUBMISSION_BATCH_LIMIT);
         let score_bytes = scalar_score_bytes.max(batched_block_score_bytes);
-        let max_block_output = candidate_capacity
-            .div_ceil(BLOCK_TOPK_TILE_CANDIDATES)
-            .saturating_mul(BLOCK_TOPK_LIMIT);
-        let max_reduced_output = max_block_output
-            .div_ceil(BLOCK_TOPK_TILE_CANDIDATES)
-            .saturating_mul(BLOCK_TOPK_LIMIT);
-        let reduction_bytes =
-            (max_reduced_output + 1).saturating_mul(std::mem::size_of::<ScoredPointOffset>());
         let query_capacity = vector_storage.vector_capacity();
         let query_bytes = query_capacity
             .saturating_mul(GPU_EXACT_SUBMISSION_BATCH_LIMIT)
@@ -542,51 +505,11 @@ impl GpuExactSearchContext {
             gpu::BufferType::GpuToCpu,
             score_bytes,
         )?;
-        let reduction_a = gpu::Buffer::new(
-            device.clone(),
-            "Exact filtered top-k reduction A",
-            gpu::BufferType::Storage,
-            reduction_bytes,
-        )?;
-        let reduction_b = gpu::Buffer::new(
-            device.clone(),
-            "Exact filtered top-k reduction B",
-            gpu::BufferType::Storage,
-            reduction_bytes,
-        )?;
-        let reduction_count_buffer = gpu::Buffer::new(
-            device.clone(),
-            "Exact filtered top-k reduction count",
-            gpu::BufferType::Storage,
-            std::mem::size_of::<u32>(),
-        )?;
-        let reduction_count_staging = gpu::Buffer::new(
-            device.clone(),
-            "Exact filtered top-k reduction count upload",
-            gpu::BufferType::CpuToGpu,
-            std::mem::size_of::<u32>(),
-        )?;
         let descriptor_set = gpu::DescriptorSet::builder(descriptor_set_layout.clone())
             .add_storage_buffer(0, candidate_buffer.clone())
             .add_storage_buffer(1, query_buffer.clone())
             .add_storage_buffer(2, score_buffer.clone())
             .build()?;
-        let reduction_initial_descriptor_set =
-            gpu::DescriptorSet::builder(reduction_initial_descriptor_set_layout)
-                .add_storage_buffer(0, score_buffer.clone())
-                .add_storage_buffer(1, reduction_a.clone())
-                .add_storage_buffer(2, reduction_count_buffer.clone())
-                .build()?;
-        let reduction_forward_descriptor_set =
-            gpu::DescriptorSet::builder(reduction_descriptor_set_layout.clone())
-                .add_storage_buffer(0, reduction_a.clone())
-                .add_storage_buffer(1, reduction_b.clone())
-                .build()?;
-        let reduction_backward_descriptor_set =
-            gpu::DescriptorSet::builder(reduction_descriptor_set_layout)
-                .add_storage_buffer(0, reduction_b.clone())
-                .add_storage_buffer(1, reduction_a.clone())
-                .build()?;
 
         Ok(Self {
             context: gpu::Context::new_with_queue_index(device, queue_index)?,
@@ -594,8 +517,6 @@ impl GpuExactSearchContext {
             block_topk_pipeline,
             visible_score_pipeline,
             visible_block_topk_pipeline,
-            reduction_initial_pipeline,
-            reduction_pipeline,
             descriptor_set,
             descriptor_set_layout,
             visibility_descriptor_set_layout,
@@ -608,13 +529,6 @@ impl GpuExactSearchContext {
             query_staging,
             score_buffer,
             score_staging,
-            reduction_a,
-            reduction_b,
-            reduction_count_buffer,
-            reduction_count_staging,
-            reduction_initial_descriptor_set,
-            reduction_forward_descriptor_set,
-            reduction_backward_descriptor_set,
             stats,
             candidate_capacity,
             query_capacity,
@@ -699,26 +613,7 @@ impl GpuExactSearchContext {
             ));
         }
         let block_count = candidates.len().div_ceil(BLOCK_TOPK_TILE_CANDIDATES);
-        let block_output_count = block_count * BLOCK_TOPK_LIMIT;
-        let use_global_topk = use_block_topk && queries.len() == 1;
-        let (global_output_count, global_topk_passes) = if use_global_topk {
-            let mut count = block_output_count;
-            let mut passes = 0;
-            while count > BLOCK_TOPK_LIMIT {
-                count = count
-                    .div_ceil(BLOCK_TOPK_TILE_CANDIDATES)
-                    .saturating_mul(BLOCK_TOPK_LIMIT);
-                passes += 1;
-            }
-            self.reduction_count_staging
-                .upload(&[block_output_count as u32], 0)?;
-            (count, passes)
-        } else {
-            (block_output_count, 0)
-        };
-        let output_count_per_query = if use_global_topk {
-            global_output_count
-        } else if use_block_topk {
+        let output_count_per_query = if use_block_topk {
             block_count * BLOCK_TOPK_LIMIT
         } else {
             candidates.len()
@@ -751,16 +646,6 @@ impl GpuExactSearchContext {
             0,
             padded_queries.len() * std::mem::size_of::<f32>(),
         )?;
-        if use_global_topk {
-            self.context.copy_gpu_buffer(
-                self.reduction_count_staging.clone(),
-                self.reduction_count_buffer.clone(),
-                0,
-                0,
-                std::mem::size_of::<u32>(),
-            )?;
-            uploaded_buffers.push(self.reduction_count_buffer.clone());
-        }
         self.context.barrier_buffers(&uploaded_buffers)?;
         let pipeline = match (has_visibility, use_block_topk) {
             (false, false) => self.score_pipeline.clone(),
@@ -781,64 +666,12 @@ impl GpuExactSearchContext {
             queries.len(),
             1,
         )?;
-        let (download_buffer, download_offset) = if use_global_topk {
-            self.context
-                .barrier_buffers(std::slice::from_ref(&self.score_buffer))?;
-            self.context.bind_pipeline(
-                self.reduction_initial_pipeline.clone(),
-                std::slice::from_ref(&self.reduction_initial_descriptor_set),
-            )?;
-            self.context.dispatch(
-                block_output_count.div_ceil(BLOCK_TOPK_TILE_CANDIDATES),
-                1,
-                1,
-            )?;
-            self.context
-                .barrier_buffers(std::slice::from_ref(&self.reduction_a))?;
-
-            let mut reduced_count = block_output_count
-                .div_ceil(BLOCK_TOPK_TILE_CANDIDATES)
-                .saturating_mul(BLOCK_TOPK_LIMIT);
-            let mut current_is_a = true;
-            while reduced_count > BLOCK_TOPK_LIMIT {
-                let descriptor_set = if current_is_a {
-                    self.reduction_forward_descriptor_set.clone()
-                } else {
-                    self.reduction_backward_descriptor_set.clone()
-                };
-                let output_buffer = if current_is_a {
-                    self.reduction_b.clone()
-                } else {
-                    self.reduction_a.clone()
-                };
-                self.context.bind_pipeline(
-                    self.reduction_pipeline.clone(),
-                    std::slice::from_ref(&descriptor_set),
-                )?;
-                self.context
-                    .dispatch(reduced_count.div_ceil(BLOCK_TOPK_TILE_CANDIDATES), 1, 1)?;
-                self.context
-                    .barrier_buffers(std::slice::from_ref(&output_buffer))?;
-                reduced_count = reduced_count
-                    .div_ceil(BLOCK_TOPK_TILE_CANDIDATES)
-                    .saturating_mul(BLOCK_TOPK_LIMIT);
-                current_is_a = !current_is_a;
-            }
-            let buffer = if current_is_a {
-                self.reduction_a.clone()
-            } else {
-                self.reduction_b.clone()
-            };
-            (buffer, std::mem::size_of::<ScoredPointOffset>())
-        } else {
-            self.context
-                .barrier_buffers(std::slice::from_ref(&self.score_buffer))?;
-            (self.score_buffer.clone(), 0)
-        };
+        self.context
+            .barrier_buffers(std::slice::from_ref(&self.score_buffer))?;
         self.context.copy_gpu_buffer(
-            download_buffer,
+            self.score_buffer.clone(),
             self.score_staging.clone(),
-            download_offset,
+            0,
             0,
             output_bytes,
         )?;
@@ -899,7 +732,6 @@ impl GpuExactSearchContext {
             resident_visibility_ns,
             resident_candidate_hit,
             resident_visibility_hit,
-            global_topk_passes,
         );
         Ok(results)
     }
@@ -1305,15 +1137,6 @@ impl GpuExactSearchCache {
             .add_storage_buffer(2)
             .add_storage_buffer(3)
             .build(device.clone())?;
-        let reduction_initial_descriptor_set_layout = gpu::DescriptorSetLayout::builder()
-            .add_storage_buffer(0)
-            .add_storage_buffer(1)
-            .add_storage_buffer(2)
-            .build(device.clone())?;
-        let reduction_descriptor_set_layout = gpu::DescriptorSetLayout::builder()
-            .add_storage_buffer(0)
-            .add_storage_buffer(1)
-            .build(device.clone())?;
         let score_shader = ShaderBuilder::new(device.clone())
             .with_shader_code(include_str!("shaders/run_exact_filtered_score.comp"))
             .with_parameters(vector_storage.as_ref())
@@ -1353,21 +1176,6 @@ impl GpuExactSearchCache {
             .add_descriptor_set_layout(0, visibility_descriptor_set_layout.clone())
             .add_descriptor_set_layout(1, vector_storage.descriptor_set_layout())
             .add_shader(visible_block_topk_shader)
-            .build(device.clone())?;
-        let reduction_shader = ShaderBuilder::new(device.clone())
-            .with_shader_code(include_str!("shaders/reduce_block_topk.comp"))
-            .build("reduce_block_topk_initial.comp")?;
-        let reduction_initial_pipeline = gpu::Pipeline::builder()
-            .add_descriptor_set_layout(0, reduction_initial_descriptor_set_layout.clone())
-            .add_shader(reduction_shader)
-            .build(device.clone())?;
-        let reduction_header_shader = ShaderBuilder::new(device.clone())
-            .with_define("INPUT_HAS_HEADER", None)
-            .with_shader_code(include_str!("shaders/reduce_block_topk.comp"))
-            .build("reduce_block_topk_header.comp")?;
-        let reduction_pipeline = gpu::Pipeline::builder()
-            .add_descriptor_set_layout(0, reduction_descriptor_set_layout.clone())
-            .add_shader(reduction_header_shader)
             .build(device)?;
 
         let stats = Arc::new(GpuExactSearchStats::default());
@@ -1379,12 +1187,8 @@ impl GpuExactSearchCache {
                     block_topk_pipeline.clone(),
                     visible_score_pipeline.clone(),
                     visible_block_topk_pipeline.clone(),
-                    reduction_initial_pipeline.clone(),
-                    reduction_pipeline.clone(),
                     descriptor_set_layout.clone(),
                     visibility_descriptor_set_layout.clone(),
-                    reduction_initial_descriptor_set_layout.clone(),
-                    reduction_descriptor_set_layout.clone(),
                     candidate_capacity,
                     queue_index,
                     stats.clone(),
@@ -1909,7 +1713,5 @@ mod tests {
             cache.stats.coalesced_queries.load(Ordering::Relaxed),
             GPU_EXACT_SUBMISSION_BATCH_LIMIT as u64,
         );
-        assert_eq!(cache.stats.global_topk_queries.load(Ordering::Relaxed), 4);
-        assert_eq!(cache.stats.global_topk_passes.load(Ordering::Relaxed), 12);
     }
 }
