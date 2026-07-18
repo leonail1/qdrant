@@ -229,7 +229,7 @@ pub struct GpuConfig {
     #[serde(default)]
     #[validate(range(max = 1000))]
     pub search_batch_window_us: Option<usize>,
-    /// Force half precision for `f32` values while indexing.
+    /// Force half precision for `f32` values while indexing and searching on GPU.
     /// `f16` conversion will take place only inside GPU memory and won't affect storage type.
     #[serde(default)]
     pub force_half_precision: bool,

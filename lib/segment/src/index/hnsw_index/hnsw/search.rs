@@ -44,7 +44,8 @@ use crate::index::hnsw_index::gpu::gpu_filtered_graph_search::GpuFilteredGraphSe
 use crate::index::hnsw_index::gpu::gpu_vector_storage::GpuVectorStorage;
 #[cfg(feature = "gpu")]
 use crate::index::hnsw_index::gpu::{
-    GPU_DEVICES_MANAGER, GPU_FILTERED_GRAPH_MIN_CANDIDATES, get_gpu_search_config,
+    GPU_DEVICES_MANAGER, GPU_FILTERED_GRAPH_MIN_CANDIDATES, get_gpu_force_half_precision,
+    get_gpu_search_config,
 };
 #[cfg(feature = "gpu")]
 use crate::vector_storage::check_deleted_condition;
@@ -66,17 +67,19 @@ impl HNSWIndex {
                     let Some(device) = manager.lock_device(is_stopped)? else {
                         return Ok(None);
                     };
+                    let force_half_precision = get_gpu_force_half_precision();
                     let gpu_vectors = std::sync::Arc::new(GpuVectorStorage::new(
                         device.device(),
                         vector_storage,
                         None,
-                        false,
+                        force_half_precision,
                         is_stopped,
                     )?);
                     log::info!(
-                        "Initialized shared GPU vector storage: points={}, aligned_dim={}, resident_vector_bytes={}",
+                        "Initialized shared GPU vector storage: points={}, aligned_dim={}, requested_half_precision={}, resident_vector_bytes={}",
                         gpu_vectors.num_vectors(),
                         gpu_vectors.dim(),
+                        force_half_precision,
                         gpu_vectors.resident_vector_bytes(),
                     );
                     Ok(Some(gpu_vectors))
