@@ -105,6 +105,9 @@ struct GpuExactSearchStats {
     prepare_ns: AtomicU64,
     h2d_ns: AtomicU64,
     gpu_d2h_ns: AtomicU64,
+    command_record_ns: AtomicU64,
+    queue_submit_ns: AtomicU64,
+    fence_wait_ns: AtomicU64,
     download_ns: AtomicU64,
     cpu_topk_ns: AtomicU64,
     resident_candidate_ns: AtomicU64,
@@ -116,6 +119,8 @@ struct GpuExactSearchStats {
     resident_candidate_misses: AtomicU64,
     resident_visibility_hits: AtomicU64,
     resident_visibility_misses: AtomicU64,
+    context_attempts: AtomicU64,
+    context_unavailable: AtomicU64,
 }
 
 impl GpuExactSearchStats {
@@ -129,6 +134,9 @@ impl GpuExactSearchStats {
         prepare_ns: u64,
         h2d_ns: u64,
         gpu_d2h_ns: u64,
+        command_record_ns: u64,
+        queue_submit_ns: u64,
+        fence_wait_ns: u64,
         download_ns: u64,
         cpu_topk_ns: u64,
         resident_candidate_ns: u64,
@@ -140,6 +148,9 @@ impl GpuExactSearchStats {
         Self::add(&self.prepare_ns, prepare_ns);
         Self::add(&self.h2d_ns, h2d_ns);
         Self::add(&self.gpu_d2h_ns, gpu_d2h_ns);
+        Self::add(&self.command_record_ns, command_record_ns);
+        Self::add(&self.queue_submit_ns, queue_submit_ns);
+        Self::add(&self.fence_wait_ns, fence_wait_ns);
         Self::add(&self.download_ns, download_ns);
         Self::add(&self.cpu_topk_ns, cpu_topk_ns);
         Self::add(&self.resident_candidate_ns, resident_candidate_ns);
@@ -189,6 +200,9 @@ impl GpuExactSearchStats {
         let prepare_ns = take(&self.prepare_ns);
         let h2d_ns = take(&self.h2d_ns);
         let gpu_d2h_ns = take(&self.gpu_d2h_ns);
+        let command_record_ns = take(&self.command_record_ns);
+        let queue_submit_ns = take(&self.queue_submit_ns);
+        let fence_wait_ns = take(&self.fence_wait_ns);
         let download_ns = take(&self.download_ns);
         let cpu_topk_ns = take(&self.cpu_topk_ns);
         let resident_candidate_ns = take(&self.resident_candidate_ns);
@@ -218,15 +232,25 @@ impl GpuExactSearchStats {
         } else {
             resident_visibility_hits as f64 / resident_visibility_lookups as f64
         };
+        let context_attempts = take(&self.context_attempts);
+        let context_unavailable = take(&self.context_unavailable);
+        let context_unavailable_rate = if context_attempts == 0 {
+            0.0
+        } else {
+            context_unavailable as f64 / context_attempts as f64
+        };
         let average_us = |value: u64| value as f64 / queries as f64 / 1_000.0;
 
         log::info!(
             "GPU exact filtered breakdown: sequence={sequence}, window_queries={queries}, \
              avg_candidates={:.1}, predicate_us={:.3}, visibility_us={:.3}, cache_us={:.3}, \
-             prepare_us={:.3}, h2d_us={:.3}, gpu_d2h_us={:.3}, mapped_download_us={:.3}, \
+             prepare_us={:.3}, h2d_us={:.3}, gpu_d2h_us={:.3}, command_record_us={:.3}, \
+             queue_submit_us={:.3}, fence_wait_us={:.3}, mapped_download_us={:.3}, \
              cpu_topk_us={:.3}, resident_candidate_us={:.3}, resident_visibility_us={:.3}, \
              postprocess_us={:.3}, filter_cache_hit_rate={:.3}, \
-             resident_candidate_hit_rate={:.3}, resident_visibility_hit_rate={:.3}",
+             resident_candidate_hit_rate={:.3}, resident_visibility_hit_rate={:.3}, \
+             context_attempts={context_attempts}, context_unavailable={context_unavailable}, \
+             context_unavailable_rate={context_unavailable_rate:.3}",
             candidates as f64 / queries as f64,
             average_us(predicate_ns),
             average_us(visibility_ns),
@@ -234,6 +258,9 @@ impl GpuExactSearchStats {
             average_us(prepare_ns),
             average_us(h2d_ns),
             average_us(gpu_d2h_ns),
+            average_us(command_record_ns),
+            average_us(queue_submit_ns),
+            average_us(fence_wait_ns),
             average_us(download_ns),
             average_us(cpu_topk_ns),
             average_us(resident_candidate_ns),
@@ -533,6 +560,7 @@ impl GpuExactSearchContext {
         let prepare_ns = prepare_started.elapsed().as_nanos() as u64;
 
         let gpu_submit_started = std::time::Instant::now();
+        let command_record_started = std::time::Instant::now();
         let mut uploaded_buffers = vec![self.query_buffer.clone()];
         if resident_candidate_hit.is_none() {
             self.context.copy_gpu_buffer(
@@ -580,8 +608,13 @@ impl GpuExactSearchContext {
             0,
             output_bytes,
         )?;
+        let command_record_ns = command_record_started.elapsed().as_nanos() as u64;
+        let queue_submit_started = std::time::Instant::now();
         self.context.run()?;
+        let queue_submit_ns = queue_submit_started.elapsed().as_nanos() as u64;
+        let fence_wait_started = std::time::Instant::now();
         self.context.wait_finish(GPU_TIMEOUT)?;
+        let fence_wait_ns = fence_wait_started.elapsed().as_nanos() as u64;
         let h2d_ns = 0;
         let gpu_d2h_ns = gpu_submit_started.elapsed().as_nanos() as u64;
 
@@ -616,6 +649,9 @@ impl GpuExactSearchContext {
             prepare_ns,
             h2d_ns,
             gpu_d2h_ns,
+            command_record_ns,
+            queue_submit_ns,
+            fence_wait_ns,
             download_ns,
             cpu_topk_ns,
             resident_candidate_ns,
@@ -815,7 +851,9 @@ impl GpuExactSearchCache {
         reuse_candidate_buffer: bool,
         visibility: Option<GpuVisibilitySnapshot<'_>>,
     ) -> OperationResult<Option<Vec<ScoredPointOffset>>> {
+        GpuExactSearchStats::add(&self.stats.context_attempts, 1);
         let Some(mut context) = self.contexts.lock().pop() else {
+            GpuExactSearchStats::add(&self.stats.context_unavailable, 1);
             return Ok(None);
         };
         let result = (|| {
