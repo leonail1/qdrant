@@ -219,6 +219,16 @@ pub struct GpuConfig {
     #[serde(default)]
     #[validate(range(min = 1))]
     pub search_contexts: Option<usize>,
+    /// Maximum compatible unary queries combined into one GPU exact submission.
+    /// A value of 1 disables cross-request batching.
+    #[serde(default)]
+    #[validate(range(min = 1, max = 4))]
+    pub search_batch_max_queries: Option<usize>,
+    /// Maximum rendezvous delay in microseconds for a compatible GPU exact batch.
+    /// A value of 0 disables cross-request batching.
+    #[serde(default)]
+    #[validate(range(max = 1000))]
+    pub search_batch_window_us: Option<usize>,
     /// Force half precision for `f32` values while indexing.
     /// `f16` conversion will take place only inside GPU memory and won't affect storage type.
     #[serde(default)]

@@ -274,6 +274,8 @@ mod gpu_router_tests {
             min_candidates: 4_096,
             max_candidates: 200_000,
             contexts: 8,
+            batch_max_queries: 1,
+            batch_window_us: 0,
         }
     }
 

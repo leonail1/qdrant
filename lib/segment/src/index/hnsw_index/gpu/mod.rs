@@ -42,6 +42,8 @@ static GPU_SEARCH_ROUTER: AtomicBool = AtomicBool::new(false);
 static GPU_SEARCH_MIN_CANDIDATES: AtomicUsize = AtomicUsize::new(4_096);
 static GPU_SEARCH_MAX_CANDIDATES: AtomicUsize = AtomicUsize::new(200_000);
 static GPU_SEARCH_CONTEXTS: AtomicUsize = AtomicUsize::new(8);
+static GPU_SEARCH_BATCH_MAX_QUERIES: AtomicUsize = AtomicUsize::new(1);
+static GPU_SEARCH_BATCH_WINDOW_US: AtomicUsize = AtomicUsize::new(0);
 
 #[derive(Clone, Copy, Debug)]
 pub struct GpuSearchConfig {
@@ -50,6 +52,8 @@ pub struct GpuSearchConfig {
     pub min_candidates: usize,
     pub max_candidates: usize,
     pub contexts: usize,
+    pub batch_max_queries: usize,
+    pub batch_window_us: usize,
 }
 
 pub fn set_gpu_force_half_precision(force_half_precision: bool) {
@@ -66,6 +70,8 @@ pub fn set_gpu_search_config(
     min_candidates: Option<usize>,
     max_candidates: Option<usize>,
     contexts: Option<usize>,
+    batch_max_queries: Option<usize>,
+    batch_window_us: Option<usize>,
 ) {
     GPU_SEARCHING.store(enabled, Ordering::Relaxed);
     GPU_SEARCH_ROUTER.store(router_enabled, Ordering::Relaxed);
@@ -78,6 +84,12 @@ pub fn set_gpu_search_config(
     if let Some(value) = contexts {
         GPU_SEARCH_CONTEXTS.store(value, Ordering::Relaxed);
     }
+    if let Some(value) = batch_max_queries {
+        GPU_SEARCH_BATCH_MAX_QUERIES.store(value, Ordering::Relaxed);
+    }
+    if let Some(value) = batch_window_us {
+        GPU_SEARCH_BATCH_WINDOW_US.store(value, Ordering::Relaxed);
+    }
 }
 
 pub fn get_gpu_search_config() -> GpuSearchConfig {
@@ -87,6 +99,8 @@ pub fn get_gpu_search_config() -> GpuSearchConfig {
         min_candidates: GPU_SEARCH_MIN_CANDIDATES.load(Ordering::Relaxed),
         max_candidates: GPU_SEARCH_MAX_CANDIDATES.load(Ordering::Relaxed),
         contexts: GPU_SEARCH_CONTEXTS.load(Ordering::Relaxed),
+        batch_max_queries: GPU_SEARCH_BATCH_MAX_QUERIES.load(Ordering::Relaxed),
+        batch_window_us: GPU_SEARCH_BATCH_WINDOW_US.load(Ordering::Relaxed),
     }
 }
 

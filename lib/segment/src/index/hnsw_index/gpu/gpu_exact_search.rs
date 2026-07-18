@@ -1,12 +1,13 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::fmt;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::mpsc::{SyncSender, sync_channel};
 
 use common::bitvec::BitSlice;
 use common::top_k::TopK;
 use common::types::{PointOffsetType, ScoredPointOffset};
-use parking_lot::Mutex;
+use parking_lot::{Condvar, Mutex};
 
 use super::GPU_TIMEOUT;
 use super::gpu_vector_storage::GpuVectorStorage;
@@ -124,6 +125,9 @@ struct GpuExactSearchStats {
     context_unavailable: AtomicU64,
     submission_batches: AtomicU64,
     submission_queries: AtomicU64,
+    coalesced_batches: AtomicU64,
+    coalesced_queries: AtomicU64,
+    coalescing_wait_ns: AtomicU64,
 }
 
 impl GpuExactSearchStats {
@@ -259,6 +263,19 @@ impl GpuExactSearchStats {
         } else {
             submission_queries as f64 / submission_batches as f64
         };
+        let coalesced_batches = take(&self.coalesced_batches);
+        let coalesced_queries = take(&self.coalesced_queries);
+        let average_coalesced_batch = if coalesced_batches == 0 {
+            0.0
+        } else {
+            coalesced_queries as f64 / coalesced_batches as f64
+        };
+        let coalescing_wait_ns = take(&self.coalescing_wait_ns);
+        let average_coalescing_wait_us = if coalesced_batches == 0 {
+            0.0
+        } else {
+            coalescing_wait_ns as f64 / coalesced_batches as f64 / 1_000.0
+        };
         let average_us = |value: u64| value as f64 / queries as f64 / 1_000.0;
 
         log::info!(
@@ -272,7 +289,10 @@ impl GpuExactSearchStats {
              context_attempts={context_attempts}, context_unavailable={context_unavailable}, \
              context_unavailable_rate={context_unavailable_rate:.3}, \
              submission_batches={submission_batches}, submission_queries={submission_queries}, \
-             average_submission_batch={average_submission_batch:.3}",
+             average_submission_batch={average_submission_batch:.3}, \
+             coalesced_batches={coalesced_batches}, coalesced_queries={coalesced_queries}, \
+             average_coalesced_batch={average_coalesced_batch:.3}, \
+             average_coalescing_wait_us={average_coalescing_wait_us:.3}",
             candidates as f64 / queries as f64,
             average_us(predicate_ns),
             average_us(visibility_ns),
@@ -767,12 +787,47 @@ impl GpuExactSearchContext {
     }
 }
 
+type GpuSubmissionResponse = OperationResult<Option<Vec<ScoredPointOffset>>>;
+
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+struct GpuSubmissionBatchKey {
+    candidates: usize,
+    candidate_buffer: usize,
+    visibility_buffer: usize,
+    top: usize,
+}
+
+struct PendingGpuQuery {
+    query: Vec<f32>,
+    resident_candidate_ns: u64,
+    resident_visibility_ns: u64,
+    response: SyncSender<GpuSubmissionResponse>,
+}
+
+struct PendingGpuSubmission {
+    id: u64,
+    candidates: Arc<Vec<PointOffsetType>>,
+    candidate_buffer: Arc<gpu::Buffer>,
+    visibility_buffer: Option<Arc<gpu::Buffer>>,
+    queries: Vec<PendingGpuQuery>,
+}
+
+#[derive(Default)]
+struct GpuSubmissionBatchState {
+    next_id: u64,
+    pending: HashMap<GpuSubmissionBatchKey, VecDeque<PendingGpuSubmission>>,
+}
+
 pub struct GpuExactSearchCache {
     contexts: Mutex<Vec<GpuExactSearchContext>>,
     resident_candidates: Mutex<GpuResidentCandidateCache>,
     resident_visibility: Mutex<GpuResidentVisibilityCache>,
+    submission_batches: Mutex<GpuSubmissionBatchState>,
+    submission_ready: Condvar,
     candidate_capacity: usize,
     context_count: usize,
+    batch_max_queries: usize,
+    batch_window: std::time::Duration,
     stats: Arc<GpuExactSearchStats>,
 }
 
@@ -782,6 +837,8 @@ impl fmt::Debug for GpuExactSearchCache {
             .debug_struct("GpuExactSearchCache")
             .field("candidate_capacity", &self.candidate_capacity)
             .field("context_count", &self.context_count)
+            .field("batch_max_queries", &self.batch_max_queries)
+            .field("batch_window", &self.batch_window)
             .finish_non_exhaustive()
     }
 }
@@ -797,6 +854,242 @@ impl GpuExactSearchCache {
             && top <= BLOCK_TOPK_LIMIT
     }
 
+    fn execute_resident_batch(
+        &self,
+        queries: &[&[f32]],
+        candidates: &[PointOffsetType],
+        top: usize,
+        candidate_buffer: Arc<gpu::Buffer>,
+        visibility_buffer: Option<Arc<gpu::Buffer>>,
+        resident_candidate_ns: u64,
+        resident_visibility_ns: u64,
+    ) -> OperationResult<Option<Vec<Vec<ScoredPointOffset>>>> {
+        GpuExactSearchStats::add(&self.stats.context_attempts, 1);
+        let Some(mut context) = self.contexts.lock().pop() else {
+            GpuExactSearchStats::add(&self.stats.context_unavailable, 1);
+            return Ok(None);
+        };
+        let resident_visibility_hit = visibility_buffer.as_ref().map(|_| true);
+        let result = context.search_batch(
+            queries,
+            candidates,
+            top,
+            Some(candidate_buffer),
+            Some(true),
+            visibility_buffer,
+            resident_visibility_hit,
+            resident_candidate_ns,
+            resident_visibility_ns,
+        );
+        self.contexts.lock().push(context);
+        result.map(Some)
+    }
+
+    fn lead_coalesced_submission(&self, key: GpuSubmissionBatchKey, batch_id: u64) {
+        let wait_started = std::time::Instant::now();
+        let submission = {
+            let mut state = self.submission_batches.lock();
+            loop {
+                let query_count = state
+                    .pending
+                    .get(&key)
+                    .and_then(|batches| batches.iter().find(|batch| batch.id == batch_id))
+                    .map(|batch| batch.queries.len())
+                    .expect("GPU submission leader lost its pending batch");
+                let elapsed = wait_started.elapsed();
+                if query_count >= self.batch_max_queries || elapsed >= self.batch_window {
+                    break;
+                }
+                self.submission_ready
+                    .wait_for(&mut state, self.batch_window - elapsed);
+            }
+
+            let (submission, remove_key) = {
+                let batches = state
+                    .pending
+                    .get_mut(&key)
+                    .expect("GPU submission batch key disappeared");
+                let position = batches
+                    .iter()
+                    .position(|batch| batch.id == batch_id)
+                    .expect("GPU submission batch ID disappeared");
+                let submission = batches
+                    .remove(position)
+                    .expect("GPU submission batch removal failed");
+                (submission, batches.is_empty())
+            };
+            if remove_key {
+                state.pending.remove(&key);
+            }
+            submission
+        };
+
+        let wait_ns = wait_started.elapsed().as_nanos() as u64;
+        GpuExactSearchStats::add(&self.stats.coalesced_batches, 1);
+        GpuExactSearchStats::add(
+            &self.stats.coalesced_queries,
+            submission.queries.len() as u64,
+        );
+        GpuExactSearchStats::add(&self.stats.coalescing_wait_ns, wait_ns);
+
+        let resident_candidate_ns = submission
+            .queries
+            .iter()
+            .map(|query| query.resident_candidate_ns)
+            .sum();
+        let resident_visibility_ns = submission
+            .queries
+            .iter()
+            .map(|query| query.resident_visibility_ns)
+            .sum();
+        let query_refs = submission
+            .queries
+            .iter()
+            .map(|query| query.query.as_slice())
+            .collect::<Vec<_>>();
+        let result = self.execute_resident_batch(
+            query_refs.as_slice(),
+            submission.candidates.as_slice(),
+            key.top,
+            submission.candidate_buffer,
+            submission.visibility_buffer,
+            resident_candidate_ns,
+            resident_visibility_ns,
+        );
+
+        match result {
+            Ok(Some(results)) if results.len() == submission.queries.len() => {
+                for (query, result) in submission.queries.into_iter().zip(results) {
+                    let _ = query.response.send(Ok(Some(result)));
+                }
+            }
+            Ok(Some(results)) => {
+                let message = format!(
+                    "GPU exact batch returned {} results for {} queries",
+                    results.len(),
+                    submission.queries.len(),
+                );
+                for query in submission.queries {
+                    let _ = query
+                        .response
+                        .send(Err(OperationError::service_error(message.clone())));
+                }
+            }
+            Ok(None) => {
+                for query in submission.queries {
+                    let _ = query.response.send(Ok(None));
+                }
+            }
+            Err(error) => {
+                let message = format!("GPU exact coalesced submission failed: {error}");
+                for query in submission.queries {
+                    let _ = query
+                        .response
+                        .send(Err(OperationError::service_error(message.clone())));
+                }
+            }
+        }
+    }
+
+    pub fn search_coalesced(
+        &self,
+        query: &[f32],
+        candidates: Arc<Vec<PointOffsetType>>,
+        top: usize,
+        reuse_candidate_buffer: bool,
+        visibility: Option<GpuVisibilitySnapshot<'_>>,
+    ) -> OperationResult<Option<Vec<ScoredPointOffset>>> {
+        if self.batch_max_queries <= 1
+            || self.batch_window.is_zero()
+            || !Self::supports_submission_batch(candidates.len(), top, reuse_candidate_buffer)
+        {
+            return self.search(query, candidates, top, reuse_candidate_buffer, visibility);
+        }
+
+        let resident_candidate_started = std::time::Instant::now();
+        let candidate_buffer = self.resident_candidates.lock().get(&candidates);
+        let resident_candidate_ns = resident_candidate_started.elapsed().as_nanos() as u64;
+        let Some(candidate_buffer) = candidate_buffer else {
+            return self.search(query, candidates, top, reuse_candidate_buffer, visibility);
+        };
+
+        let resident_visibility_started = std::time::Instant::now();
+        let visibility_buffer = if let Some(visibility) = visibility {
+            if visibility.generation == 0
+                || visibility.point_count == 0
+                || visibility.deleted.len() > visibility.point_count
+            {
+                return Err(OperationError::service_error(
+                    "GPU visibility snapshot identity is invalid",
+                ));
+            }
+            self.resident_visibility
+                .lock()
+                .get(visibility.generation, visibility.point_count)
+        } else {
+            None
+        };
+        let resident_visibility_ns = resident_visibility_started.elapsed().as_nanos() as u64;
+        if visibility.is_some() && visibility_buffer.is_none() {
+            return self.search(query, candidates, top, reuse_candidate_buffer, visibility);
+        }
+
+        let key = GpuSubmissionBatchKey {
+            candidates: Arc::as_ptr(&candidates) as usize,
+            candidate_buffer: Arc::as_ptr(&candidate_buffer) as usize,
+            visibility_buffer: visibility_buffer
+                .as_ref()
+                .map_or(0, |buffer| Arc::as_ptr(buffer) as usize),
+            top,
+        };
+        let (sender, receiver) = sync_channel(1);
+        let mut pending_query = Some(PendingGpuQuery {
+            query: query.to_vec(),
+            resident_candidate_ns,
+            resident_visibility_ns,
+            response: sender,
+        });
+        let (batch_id, is_leader) = {
+            let mut state = self.submission_batches.lock();
+            if let Some(batch) = state
+                .pending
+                .get_mut(&key)
+                .and_then(|batches| batches.back_mut())
+                .filter(|batch| batch.queries.len() < self.batch_max_queries)
+            {
+                batch
+                    .queries
+                    .push(pending_query.take().expect("pending GPU query missing"));
+                self.submission_ready.notify_all();
+                (batch.id, false)
+            } else {
+                state.next_id = state.next_id.wrapping_add(1).max(1);
+                let batch_id = state.next_id;
+                state
+                    .pending
+                    .entry(key)
+                    .or_default()
+                    .push_back(PendingGpuSubmission {
+                        id: batch_id,
+                        candidates,
+                        candidate_buffer,
+                        visibility_buffer,
+                        queries: vec![pending_query.take().expect("pending GPU query missing")],
+                    });
+                (batch_id, true)
+            }
+        };
+
+        if is_leader {
+            self.lead_coalesced_submission(key, batch_id);
+        }
+        receiver.recv().map_err(|error| {
+            OperationError::service_error(format!(
+                "GPU exact coalesced response channel closed: {error}",
+            ))
+        })?
+    }
+
     pub fn clear_resident_candidates(&self) {
         self.resident_candidates.lock().clear();
         self.resident_visibility.lock().clear();
@@ -807,9 +1100,15 @@ impl GpuExactSearchCache {
         vector_storage: &crate::vector_storage::VectorStorageEnum,
         candidate_capacity: usize,
         context_count: usize,
+        batch_max_queries: usize,
+        batch_window_us: usize,
         stopped: &std::sync::atomic::AtomicBool,
     ) -> OperationResult<Self> {
-        if candidate_capacity == 0 || context_count == 0 {
+        if candidate_capacity == 0
+            || context_count == 0
+            || batch_max_queries == 0
+            || batch_max_queries > GPU_EXACT_SUBMISSION_BATCH_LIMIT
+        {
             return Err(OperationError::service_error(
                 "GPU exact capacities must be positive",
             ));
@@ -901,8 +1200,12 @@ impl GpuExactSearchCache {
             contexts: Mutex::new(contexts),
             resident_candidates: Mutex::new(GpuResidentCandidateCache::default()),
             resident_visibility: Mutex::new(GpuResidentVisibilityCache::default()),
+            submission_batches: Mutex::new(GpuSubmissionBatchState::default()),
+            submission_ready: Condvar::new(),
             candidate_capacity,
             context_count,
+            batch_max_queries,
+            batch_window: std::time::Duration::from_micros(batch_window_us as u64),
             stats,
         })
     }
@@ -1100,7 +1403,7 @@ mod tests {
         let device = gpu::Device::new(instance.clone(), &instance.physical_devices()[0]).unwrap();
         let stopped = AtomicBool::new(false);
         let cache =
-            Arc::new(GpuExactSearchCache::new(device, &storage, COUNT, 8, &stopped).unwrap());
+            Arc::new(GpuExactSearchCache::new(device, &storage, COUNT, 8, 1, 0, &stopped).unwrap());
         let query = Arc::new(query);
         let candidates = Arc::new((0..COUNT as PointOffsetType).collect::<Vec<_>>());
         let mut observed = Vec::new();
@@ -1215,7 +1518,9 @@ mod tests {
         let instance = gpu::Instance::builder().build().unwrap();
         let device = gpu::Device::new(instance.clone(), &instance.physical_devices()[0]).unwrap();
         let stopped = AtomicBool::new(false);
-        let cache = GpuExactSearchCache::new(device, &storage, COUNT, 1, &stopped).unwrap();
+        let cache = Arc::new(
+            GpuExactSearchCache::new(device, &storage, COUNT, 1, 4, 50_000, &stopped).unwrap(),
+        );
         let candidates = Arc::new((0..COUNT as PointOffsetType).collect::<Vec<_>>());
 
         let mut expected = vectors
@@ -1325,7 +1630,7 @@ mod tests {
         let visible_batch_results = cache
             .search_batch(
                 &batch_queries,
-                candidates,
+                candidates.clone(),
                 TOP,
                 true,
                 Some(GpuVisibilitySnapshot {
@@ -1350,5 +1655,63 @@ mod tests {
             assert_eq!(actual.idx, expected.idx);
             assert!((actual.score - expected.score).abs() < 1e-4);
         }
+
+        let deleted = Arc::new(deleted);
+        let query = Arc::new(query);
+        let query_two = Arc::new(query_two);
+        let barrier = Arc::new(std::sync::Barrier::new(
+            GPU_EXACT_SUBMISSION_BATCH_LIMIT + 1,
+        ));
+        let threads = (0..GPU_EXACT_SUBMISSION_BATCH_LIMIT)
+            .map(|query_index| {
+                let cache = cache.clone();
+                let candidates = candidates.clone();
+                let deleted = deleted.clone();
+                let query = if query_index.is_multiple_of(2) {
+                    query.clone()
+                } else {
+                    query_two.clone()
+                };
+                let barrier = barrier.clone();
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    cache
+                        .search_coalesced(
+                            query.as_slice(),
+                            candidates,
+                            TOP,
+                            true,
+                            Some(GpuVisibilitySnapshot {
+                                generation: 12,
+                                deleted: deleted.as_bitslice(),
+                                point_count: COUNT,
+                            }),
+                        )
+                        .unwrap()
+                        .unwrap()
+                })
+            })
+            .collect::<Vec<_>>();
+        barrier.wait();
+        let coalesced_results = threads
+            .into_iter()
+            .map(|thread| thread.join().unwrap())
+            .collect::<Vec<_>>();
+        for (query_index, result) in coalesced_results.iter().enumerate() {
+            let expected = if query_index.is_multiple_of(2) {
+                &visible_expected
+            } else {
+                &visible_expected_two
+            };
+            for (actual, expected) in result.iter().zip(expected[..TOP].iter().copied()) {
+                assert_eq!(actual.idx, expected.idx);
+                assert!((actual.score - expected.score).abs() < 1e-4);
+            }
+        }
+        assert_eq!(cache.stats.coalesced_batches.load(Ordering::Relaxed), 1);
+        assert_eq!(
+            cache.stats.coalesced_queries.load(Ordering::Relaxed),
+            GPU_EXACT_SUBMISSION_BATCH_LIMIT as u64,
+        );
     }
 }
