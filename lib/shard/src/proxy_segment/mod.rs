@@ -6,6 +6,7 @@ mod vector_name_changes;
 mod tests;
 
 use std::borrow::Cow;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use ahash::AHashMap;
 use common::bitvec::BitVec;
@@ -20,6 +21,21 @@ use crate::locked_segment::LockedSegment;
 
 pub type DeletedPoints = AHashMap<PointIdType, ProxyDeletedPoint>;
 
+/// Process-unique identities for immutable proxy deletion snapshots.
+///
+/// A generation is never reused for different bit contents. GPU caches may
+/// therefore key a resident visibility buffer by generation without hashing a
+/// million-bit mask on every query.
+static NEXT_VISIBILITY_GENERATION: AtomicU64 = AtomicU64::new(1);
+
+fn next_visibility_generation() -> u64 {
+    NEXT_VISIBILITY_GENERATION
+        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |next| {
+            next.checked_add(1)
+        })
+        .expect("proxy visibility generation exhausted")
+}
+
 /// This object is a wrapper around read-only segment.
 ///
 /// It could be used to provide all read and write operations while wrapped segment is being optimized (i.e. not available for writing)
@@ -31,6 +47,8 @@ pub struct ProxySegment {
     /// Present if the wrapped segment is a plain segment
     /// Used for faster deletion checks
     deleted_mask: Option<BitVec>,
+    /// Identity of the current `deleted_mask` contents. Zero means no mask.
+    visibility_generation: u64,
     changed_indexes: ProxyIndexChanges,
     changed_vector_names: ProxyVectorNameChanges,
     /// Points which should no longer used from wrapped_segment
@@ -85,6 +103,7 @@ impl UnsyncedProxySegment {
             wrapped_segment: segment,
             // Synced only in `finalize`, once the wrapped segment is frozen.
             deleted_mask: None,
+            visibility_generation: 0,
             changed_indexes: ProxyIndexChanges::default(),
             changed_vector_names: ProxyVectorNameChanges::default(),
             deleted_points: AHashMap::new(),
@@ -141,6 +160,7 @@ impl ProxySegment {
         match &self.wrapped_segment {
             LockedSegment::Original(raw_segment) => {
                 self.deleted_mask = Some(raw_segment.read().get_deleted_points_bitvec());
+                self.visibility_generation = next_visibility_generation();
             }
             LockedSegment::Proxy(_) => {
                 // A double proxy has no own deleted bitvec to sync.
@@ -192,19 +212,28 @@ impl ProxySegment {
     }
 
     /// Updates the deleted mask with the given point offset
-    /// Ensures that the mask is resized if necessary and returns false
-    /// if either the mask or the point offset is missing (mask is not applicable)
+    /// Ensures that the mask is resized if necessary. Returns true only if the
+    /// visible snapshot changed from live to deleted.
     fn set_deleted_offset(&mut self, point_offset: Option<PointOffsetType>) -> bool {
-        match (&mut self.deleted_mask, point_offset) {
+        let changed = match (&mut self.deleted_mask, point_offset) {
             (Some(deleted_mask), Some(point_offset)) => {
+                let was_deleted = deleted_mask
+                    .get(point_offset as usize)
+                    .as_deref()
+                    .copied()
+                    .unwrap_or(false);
                 if deleted_mask.len() <= point_offset as usize {
                     deleted_mask.resize(point_offset as usize + 1, false);
                 }
                 deleted_mask.set(point_offset as usize, true);
-                true
+                !was_deleted
             }
             _ => false,
+        };
+        if changed {
+            self.visibility_generation = next_visibility_generation();
         }
+        changed
     }
 
     /// Build a filter that excludes the given deleted points. Accepts

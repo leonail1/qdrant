@@ -162,6 +162,25 @@ fn test_proxy_deleted_mask_resync_after_race_window_write() {
 }
 
 #[test]
+fn test_visibility_generation_changes_only_when_mask_changes() {
+    let dir = Builder::new().prefix("segment_dir").tempdir().unwrap();
+    let original_segment = LockedSegment::new(empty_segment(dir.path()));
+    let mut proxy = ProxySegment::new(original_segment);
+
+    let initial_generation = proxy.visibility_generation;
+    assert_ne!(initial_generation, 0);
+    assert!(!proxy.set_deleted_offset(None));
+    assert_eq!(proxy.visibility_generation, initial_generation);
+
+    assert!(proxy.set_deleted_offset(Some(7)));
+    let deleted_generation = proxy.visibility_generation;
+    assert_ne!(deleted_generation, initial_generation);
+
+    assert!(!proxy.set_deleted_offset(Some(7)));
+    assert_eq!(proxy.visibility_generation, deleted_generation);
+}
+
+#[test]
 fn test_search_batch_equivalence_single() {
     let dir = Builder::new().prefix("segment_dir").tempdir().unwrap();
     let original_segment = LockedSegment::new(build_segment_1(dir.path()));

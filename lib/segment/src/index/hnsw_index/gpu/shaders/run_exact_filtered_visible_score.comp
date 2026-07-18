@@ -1,0 +1,57 @@
+#version 450
+
+#include "extensions.comp"
+#include "common.comp"
+
+layout(local_size_x = SUBGROUP_SIZE, local_size_y = 1, local_size_z = 1) in;
+
+#define VECTOR_STORAGE_LAYOUT_SET 1
+#include "vector_storage.comp"
+
+layout(set = 0, binding = 0) readonly buffer CandidateIds {
+    uint data[];
+} candidate_ids;
+
+layout(set = 0, binding = 1) readonly buffer QueryVector {
+    vec4 data[];
+} query_vector;
+
+layout(set = 0, binding = 2) writeonly buffer CandidateScores {
+    float data[];
+} candidate_scores;
+
+// LSB-first words: bit 1 means the base ordinal is invisible in this read view.
+layout(set = 0, binding = 3) readonly buffer DeletedWords {
+    uint data[];
+} deleted_words;
+
+void load_query_target() {
+#ifdef SINGLE_SUBGROUP_PER_VECTOR
+    target_cache = query_vector.data[gl_SubgroupInvocationID];
+#else
+    for (uint i = 0; i < SUBGROUPS_COUNT_PER_VECTOR; i++) {
+        target_cache[i] = query_vector.data[i * SUBGROUP_SIZE + gl_SubgroupInvocationID];
+    }
+#endif
+}
+
+bool is_visible(uint point_id) {
+    uint word = point_id >> 5;
+    if (word >= deleted_words.data.length()) {
+        return false;
+    }
+    return ((deleted_words.data[word] >> (point_id & 31)) & 1u) == 0u;
+}
+
+void main() {
+    uint candidate_index = SUBGROUP_ID;
+    uint point_id = candidate_ids.data[candidate_index];
+    load_query_target();
+    float score = negative_infinity;
+    if (is_visible(point_id)) {
+        score = similarity(point_id);
+    }
+    if (subgroupElect()) {
+        candidate_scores.data[candidate_index] = score;
+    }
+}

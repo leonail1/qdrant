@@ -113,6 +113,7 @@ impl QueryContext {
         SegmentQueryContext {
             query_context: self,
             deleted_points: None,
+            deleted_points_generation: None,
             hardware_counter: self.hardware_usage_accumulator.get_counter_cell(),
         }
     }
@@ -134,6 +135,7 @@ impl Default for QueryContext {
 pub struct SegmentQueryContext<'a> {
     query_context: &'a QueryContext,
     deleted_points: Option<&'a BitSlice>,
+    deleted_points_generation: Option<u64>,
     hardware_counter: HardwareCounterCell,
 }
 
@@ -154,12 +156,28 @@ impl<'a> SegmentQueryContext<'a> {
                 .get(vector_name)
                 .copied(),
             deleted_points: self.deleted_points,
+            deleted_points_generation: self.deleted_points_generation,
             hardware_counter: self.hardware_counter.fork(),
         }
     }
 
     pub fn with_deleted_points(mut self, deleted_points: &'a BitSlice) -> Self {
         self.deleted_points = Some(deleted_points);
+        self.deleted_points_generation = None;
+        self
+    }
+
+    /// Attach a stable deletion snapshot identity to this segment read view.
+    ///
+    /// The caller must keep `deleted_points` immutable for the complete segment
+    /// search and must never reuse `generation` for different bit contents.
+    pub fn with_deleted_points_generation(
+        mut self,
+        deleted_points: &'a BitSlice,
+        generation: u64,
+    ) -> Self {
+        self.deleted_points = Some(deleted_points);
+        self.deleted_points_generation = Some(generation);
         self
     }
 
@@ -171,6 +189,7 @@ impl<'a> SegmentQueryContext<'a> {
         Self {
             query_context: self.query_context,
             deleted_points: self.deleted_points,
+            deleted_points_generation: self.deleted_points_generation,
             hardware_counter: self.hardware_counter.fork(),
         }
     }
@@ -191,6 +210,9 @@ pub struct VectorQueryContext<'a> {
 
     deleted_points: Option<&'a BitSlice>,
 
+    /// Process-unique identity for the contents of `deleted_points`.
+    deleted_points_generation: Option<u64>,
+
     hardware_counter: HardwareCounterCell,
 }
 
@@ -205,6 +227,10 @@ impl VectorQueryContext<'_> {
 
     pub fn deleted_points(&self) -> Option<&BitSlice> {
         self.deleted_points
+    }
+
+    pub fn deleted_points_generation(&self) -> Option<u64> {
+        self.deleted_points_generation
     }
 
     pub fn is_stopped(&self) -> SimpleCow<'_, AtomicBool> {
@@ -253,6 +279,7 @@ impl Default for VectorQueryContext<'_> {
             idf: None,
             indexed_vectors: None,
             deleted_points: None,
+            deleted_points_generation: None,
             hardware_counter: HardwareCounterCell::new(),
         }
     }

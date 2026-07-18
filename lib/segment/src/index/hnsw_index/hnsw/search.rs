@@ -35,7 +35,7 @@ pub(super) fn gpu_filter_cacheable(filter: &Filter) -> bool {
     })
 }
 #[cfg(feature = "gpu")]
-use crate::index::hnsw_index::gpu::gpu_exact_search::GpuExactSearchCache;
+use crate::index::hnsw_index::gpu::gpu_exact_search::{GpuExactSearchCache, GpuVisibilitySnapshot};
 #[cfg(feature = "gpu")]
 use crate::index::hnsw_index::gpu::{GPU_DEVICES_MANAGER, get_gpu_search_config};
 #[cfg(feature = "gpu")]
@@ -117,10 +117,24 @@ impl HNSWIndex {
             .unwrap_or_else(|| id_tracker.deleted_point_bitslice());
         let deleted_vectors = vector_storage.deleted_vector_bitslice();
         let visibility_started = std::time::Instant::now();
-        let reuse_candidate_buffer = filter_cache_hit.is_some()
-            && vector_query_context.deleted_points().is_none()
+        let visibility_snapshot = vector_query_context
+            .deleted_points()
+            .zip(vector_query_context.deleted_points_generation())
+            .filter(|(deleted, generation)| {
+                *generation != 0
+                    && deleted.len() == vector_storage.total_vector_count()
+                    && id_tracker.deleted_point_count() == 0
+                    && vector_storage.deleted_vector_count() == 0
+            })
+            .map(|(deleted, generation)| GpuVisibilitySnapshot {
+                generation,
+                deleted,
+            });
+        let no_deletions = vector_query_context.deleted_points().is_none()
             && id_tracker.deleted_point_count() == 0
             && vector_storage.deleted_vector_count() == 0;
+        let reuse_candidate_buffer =
+            filter_cache_hit.is_some() && (no_deletions || visibility_snapshot.is_some());
         let candidates = if reuse_candidate_buffer {
             filtered_points.clone()
         } else {
@@ -148,8 +162,13 @@ impl HNSWIndex {
         };
         let mut results = Vec::with_capacity(dense_queries.len());
         for query in dense_queries {
-            let Some(result) =
-                cache.search(query, candidates.clone(), top, reuse_candidate_buffer)?
+            let Some(result) = cache.search(
+                query,
+                candidates.clone(),
+                top,
+                reuse_candidate_buffer,
+                visibility_snapshot,
+            )?
             else {
                 return Ok(None);
             };
@@ -161,7 +180,7 @@ impl HNSWIndex {
         for (search_result, query_vector) in results.iter_mut().zip(query_vectors) {
             *search_result = postprocess_search_result(
                 std::mem::take(search_result),
-                id_tracker.deleted_point_bitslice(),
+                deleted_points,
                 &vector_storage,
                 quantized_vectors.as_ref(),
                 query_vector,
