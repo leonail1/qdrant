@@ -1,0 +1,132 @@
+#version 450
+
+#include "extensions.comp"
+
+#include "common.comp"
+layout(local_size_x = SUBGROUP_SIZE, local_size_y = 1, local_size_z = 1) in;
+
+#define VECTOR_STORAGE_LAYOUT_SET 1
+#include "vector_storage.comp"
+
+#define LINKS_LAYOUT_SET 2
+#include "links.comp"
+
+#define VISITED_FLAGS_LAYOUT_SET 3
+#include "visited_flags.comp"
+
+#include "search_context.comp"
+
+layout(set = 0, binding = 0) readonly buffer QueryVector {
+    vec4 data[];
+} query_vector;
+
+layout(set = 0, binding = 1) writeonly buffer SearchResults {
+    ScoredPoint data[];
+} search_results;
+
+layout(set = 0, binding = 2) readonly buffer PredicateWords {
+    uint data[];
+} predicate_words;
+
+layout(set = 0, binding = 3) readonly buffer DeletedWords {
+    uint data[];
+} deleted_words;
+
+struct SearchRequest {
+    uint entry;
+    uint top;
+    uint point_count;
+    uint reserved;
+};
+
+layout(set = 0, binding = 4) readonly buffer SearchRequestBuffer {
+    SearchRequest data;
+} search_request;
+
+void load_query_target() {
+#ifdef SINGLE_SUBGROUP_PER_VECTOR
+    target_cache = query_vector.data[gl_SubgroupInvocationID];
+#else
+    for (uint i = 0; i < SUBGROUPS_COUNT_PER_VECTOR; i++) {
+        target_cache[i] = query_vector.data[
+            i * SUBGROUP_SIZE + gl_SubgroupInvocationID
+        ];
+    }
+#endif
+}
+
+bool is_visible_match(uint point_id) {
+    if (point_id >= search_request.data.point_count) {
+        return false;
+    }
+    uint word = point_id >> 5;
+    uint mask = 1u << (point_id & 31u);
+    return (predicate_words.data[word] & mask) != 0u
+        && (deleted_words.data[word] & mask) == 0u;
+}
+
+void process_filtered_candidate(uint candidate_id) {
+    uint links_count = LINKS_COUNT(candidate_id);
+    uint eligible_count = 0;
+    uint subgroup_link = 0;
+    bool subgroup_is_visited = true;
+    uint invocation = gl_SubgroupInvocationID;
+
+    for (uint i = 0; i < links_count && eligible_count < LEVEL_M; i++) {
+        if (i % SUBGROUP_SIZE == 0 && i + invocation < links_count) {
+            subgroup_link = GET_LINK(candidate_id, i + invocation);
+            subgroup_is_visited = true;
+            if (is_visible_match(subgroup_link)) {
+                subgroup_is_visited = check_visited(subgroup_link);
+            }
+        }
+
+        uint link = subgroupShuffle(subgroup_link, i % SUBGROUP_SIZE);
+        bool is_match = is_visible_match(link);
+        bool is_visited = subgroupShuffle(subgroup_is_visited, i % SUBGROUP_SIZE);
+        if (is_match && !is_visited) {
+            eligible_count++;
+            process_candidate(ScoredPoint(link, similarity(link)));
+        }
+    }
+    subgroupMemoryBarrierBuffer();
+}
+
+uint filtered_search(ScoredPoint entry) {
+    if (subgroupElect()) {
+        check_visited(entry.id);
+    }
+    bheap_push(NEAREST_HEAP_OFFSET, nearest_count, EF, entry);
+    bheap_push(CANDIDATES_HEAP_OFFSET, candidates_count, EF, entry);
+    groupMemoryBarrier();
+
+    while (candidates_count > 0) {
+        ScoredPoint candidate = bheap_pop_max(CANDIDATES_HEAP_OFFSET, candidates_count);
+        if (candidate.score < bheap_top(NEAREST_HEAP_OFFSET).score) {
+            continue;
+        }
+        process_filtered_candidate(candidate.id);
+    }
+
+    nearest_count = bheap_into_array(NEAREST_HEAP_OFFSET, nearest_count);
+    return nearest_count;
+}
+
+void main() {
+    search_context_init();
+    load_query_target();
+    uint entry = search_request.data.entry;
+    uint count = filtered_search(ScoredPoint(entry, similarity(entry)));
+    barrier();
+
+    if (subgroupElect()) {
+        uint output_count = min(search_request.data.top, count);
+        uint i = 0;
+        for (; i < output_count; i++) {
+            search_results.data[i] = shared_buffer[NEAREST_HEAP_OFFSET + i];
+        }
+        for (; i < search_request.data.top; i++) {
+            search_results.data[i] = ScoredPoint(INVALID_POINT_ID, 0.0);
+        }
+    }
+}

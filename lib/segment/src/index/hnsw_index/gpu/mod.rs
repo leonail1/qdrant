@@ -1,6 +1,7 @@
 pub mod batched_points;
 pub mod gpu_devices_manager;
 pub mod gpu_exact_search;
+pub mod gpu_filtered_graph_search;
 pub mod gpu_graph_builder;
 pub mod gpu_insert_context;
 pub mod gpu_level_builder;

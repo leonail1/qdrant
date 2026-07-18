@@ -55,6 +55,21 @@ impl ShaderBuilderParameters for GpuLinks {
 }
 
 impl GpuLinks {
+    pub fn max_links_on_level(
+        graph: &impl GraphLayersBase,
+        points_count: usize,
+        level: usize,
+    ) -> usize {
+        (0..points_count as PointOffsetType)
+            .map(|point_id| {
+                let mut count = 0;
+                graph.for_each_link(point_id, level, |_| count += 1);
+                count
+            })
+            .max()
+            .unwrap_or(0)
+    }
+
     pub fn new(
         device: Arc<gpu::Device>,
         m: usize,
@@ -205,6 +220,46 @@ impl GpuLinks {
         }
 
         log::trace!("Upload links on level {level} time: {:?}", timer.elapsed());
+        Ok(())
+    }
+
+    /// Upload an immutable, already-built Qdrant graph layer.
+    ///
+    /// Unlike [`Self::upload_links`], this consumes [`GraphLayersBase`] rather
+    /// than the mutable construction graph. The GPU buffer is only a resident
+    /// projection of Qdrant's native graph and is never persisted separately.
+    pub fn upload_graph_layer(
+        &mut self,
+        level: usize,
+        graph: &impl GraphLayersBase,
+        points_count: usize,
+        gpu_context: &mut gpu::Context,
+        stopped: &AtomicBool,
+    ) -> OperationResult<()> {
+        self.update_params(gpu_context, graph.get_m(level))?;
+        self.clear(gpu_context)?;
+
+        for start in (0..points_count).step_by(self.max_patched_points) {
+            check_stopped(stopped)?;
+            let end = (start + self.max_patched_points).min(points_count);
+            for point_id in start..end {
+                let mut links = Vec::new();
+                graph.for_each_link(point_id as PointOffsetType, level, |link| links.push(link));
+                if links.len() > self.links_capacity {
+                    return Err(OperationError::service_error(format!(
+                        "GPU graph link capacity exceeded at point {point_id}: {} > {}",
+                        links.len(),
+                        self.links_capacity,
+                    )));
+                }
+                if !links.is_empty() {
+                    self.set_links(point_id as PointOffsetType, &links)?;
+                }
+            }
+            self.apply_gpu_patches(gpu_context)?;
+            gpu_context.run()?;
+            gpu_context.wait_finish(GPU_TIMEOUT)?;
+        }
         Ok(())
     }
 
