@@ -25,6 +25,10 @@ const BLOCK_TOPK_TILE_CANDIDATES: usize = 128;
 pub struct GpuVisibilitySnapshot<'a> {
     pub generation: u64,
     pub deleted: &'a BitSlice,
+    /// Full vector ordinal space covered by this read view. Proxy deletion
+    /// masks may be shorter because their bitvec only grows to the highest
+    /// deleted ordinal; missing bits are live.
+    pub point_count: usize,
 }
 
 /// Bounded, segment-local cache of payload-index candidate materializations.
@@ -320,13 +324,14 @@ impl GpuResidentVisibilityCache {
     }
 }
 
-fn pack_deleted_words(deleted: &BitSlice) -> Vec<u32> {
-    let mut words = vec![0u32; deleted.len().div_ceil(u32::BITS as usize)];
+fn pack_deleted_words(deleted: &BitSlice, point_count: usize) -> Vec<u32> {
+    debug_assert!(deleted.len() <= point_count);
+    let mut words = vec![0u32; point_count.div_ceil(u32::BITS as usize)];
     for index in deleted.iter_ones() {
         words[index / u32::BITS as usize] |= 1u32 << (index % u32::BITS as usize);
     }
     if let Some(last) = words.last_mut() {
-        let valid_bits = deleted.len() % u32::BITS as usize;
+        let valid_bits = point_count % u32::BITS as usize;
         if valid_bits != 0 {
             *last |= !((1u32 << valid_bits) - 1);
         }
@@ -831,22 +836,25 @@ impl GpuExactSearchCache {
             let resident_visibility_started = std::time::Instant::now();
             let (visibility_buffer, resident_visibility_hit) = if let Some(visibility) = visibility
             {
-                if visibility.generation == 0 || visibility.deleted.is_empty() {
+                if visibility.generation == 0
+                    || visibility.point_count == 0
+                    || visibility.deleted.len() > visibility.point_count
+                {
                     return Err(OperationError::service_error(
                         "GPU visibility snapshot identity is invalid",
                     ));
                 }
                 let mut resident_visibility = self.resident_visibility.lock();
                 if let Some(buffer) =
-                    resident_visibility.get(visibility.generation, visibility.deleted.len())
+                    resident_visibility.get(visibility.generation, visibility.point_count)
                 {
                     (Some(buffer), Some(true))
                 } else {
-                    let words = pack_deleted_words(visibility.deleted);
+                    let words = pack_deleted_words(visibility.deleted, visibility.point_count);
                     let buffer = context.upload_resident_visibility(words.as_slice())?;
                     resident_visibility.insert(
                         visibility.generation,
-                        visibility.deleted.len(),
+                        visibility.point_count,
                         buffer.clone(),
                     );
                     (Some(buffer), Some(false))
@@ -919,11 +927,25 @@ mod tests {
         deleted.set(0, true);
         deleted.set(31, true);
         deleted.set(33, true);
-        let words = pack_deleted_words(&deleted);
+        let words = pack_deleted_words(&deleted, deleted.len());
         assert_eq!(words.len(), 2);
         assert_eq!(words[0], 0x8000_0001);
         assert_eq!(words[1] & 0b111, 0b010);
         assert_eq!(words[1] >> 3, (1u32 << 29) - 1);
+    }
+
+    #[test]
+    fn deleted_words_zero_fill_a_short_proxy_mask() {
+        let mut deleted = BitVec::repeat(false, 5);
+        deleted.set(1, true);
+        deleted.set(4, true);
+
+        let words = pack_deleted_words(&deleted, 65);
+
+        assert_eq!(words.len(), 3);
+        assert_eq!(words[0], 0b1_0010);
+        assert_eq!(words[1], 0);
+        assert_eq!(words[2], u32::MAX << 1);
     }
 
     #[test]
@@ -1027,6 +1049,7 @@ mod tests {
                     Some(GpuVisibilitySnapshot {
                         generation: 7,
                         deleted: &deleted,
+                        point_count: COUNT,
                     }),
                 )
                 .unwrap()
@@ -1123,6 +1146,7 @@ mod tests {
                     Some(GpuVisibilitySnapshot {
                         generation: 11,
                         deleted: &deleted,
+                        point_count: COUNT,
                     }),
                 )
                 .unwrap()

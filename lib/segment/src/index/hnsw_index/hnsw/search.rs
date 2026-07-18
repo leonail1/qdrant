@@ -116,19 +116,21 @@ impl HNSWIndex {
             .deleted_points()
             .unwrap_or_else(|| id_tracker.deleted_point_bitslice());
         let deleted_vectors = vector_storage.deleted_vector_bitslice();
+        let point_count = vector_storage.total_vector_count();
         let visibility_started = std::time::Instant::now();
         let visibility_snapshot = vector_query_context
             .deleted_points()
             .zip(vector_query_context.deleted_points_generation())
             .filter(|(deleted, generation)| {
                 *generation != 0
-                    && deleted.len() == vector_storage.total_vector_count()
+                    && deleted.len() <= point_count
                     && id_tracker.deleted_point_count() == 0
                     && vector_storage.deleted_vector_count() == 0
             })
             .map(|(deleted, generation)| GpuVisibilitySnapshot {
                 generation,
                 deleted,
+                point_count,
             });
         let no_deletions = vector_query_context.deleted_points().is_none()
             && id_tracker.deleted_point_count() == 0
