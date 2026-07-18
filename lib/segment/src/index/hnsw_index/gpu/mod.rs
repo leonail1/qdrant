@@ -38,6 +38,7 @@ pub const GPU_GROUPS_COUNT_DEFAULT: usize = 512;
 static GPU_FORCE_HALF_PRECISION: AtomicBool = AtomicBool::new(false);
 
 static GPU_SEARCHING: AtomicBool = AtomicBool::new(false);
+static GPU_SEARCH_ROUTER: AtomicBool = AtomicBool::new(false);
 static GPU_SEARCH_MIN_CANDIDATES: AtomicUsize = AtomicUsize::new(4_096);
 static GPU_SEARCH_MAX_CANDIDATES: AtomicUsize = AtomicUsize::new(200_000);
 static GPU_SEARCH_CONTEXTS: AtomicUsize = AtomicUsize::new(8);
@@ -45,6 +46,7 @@ static GPU_SEARCH_CONTEXTS: AtomicUsize = AtomicUsize::new(8);
 #[derive(Clone, Copy, Debug)]
 pub struct GpuSearchConfig {
     pub enabled: bool,
+    pub router_enabled: bool,
     pub min_candidates: usize,
     pub max_candidates: usize,
     pub contexts: usize,
@@ -60,11 +62,13 @@ pub fn get_gpu_force_half_precision() -> bool {
 
 pub fn set_gpu_search_config(
     enabled: bool,
+    router_enabled: bool,
     min_candidates: Option<usize>,
     max_candidates: Option<usize>,
     contexts: Option<usize>,
 ) {
     GPU_SEARCHING.store(enabled, Ordering::Relaxed);
+    GPU_SEARCH_ROUTER.store(router_enabled, Ordering::Relaxed);
     if let Some(value) = min_candidates {
         GPU_SEARCH_MIN_CANDIDATES.store(value, Ordering::Relaxed);
     }
@@ -79,6 +83,7 @@ pub fn set_gpu_search_config(
 pub fn get_gpu_search_config() -> GpuSearchConfig {
     GpuSearchConfig {
         enabled: GPU_SEARCHING.load(Ordering::Relaxed),
+        router_enabled: GPU_SEARCH_ROUTER.load(Ordering::Relaxed),
         min_candidates: GPU_SEARCH_MIN_CANDIDATES.load(Ordering::Relaxed),
         max_candidates: GPU_SEARCH_MAX_CANDIDATES.load(Ordering::Relaxed),
         contexts: GPU_SEARCH_CONTEXTS.load(Ordering::Relaxed),

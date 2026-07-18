@@ -213,6 +213,7 @@ fn init_gpu_devices(settings_gpu: &crate::settings::GpuConfig) {
     set_gpu_groups_count(settings_gpu.groups_count);
     set_gpu_search_config(
         settings_gpu.searching,
+        settings_gpu.search_router,
         settings_gpu.search_min_candidates,
         settings_gpu.search_max_candidates,
         settings_gpu.search_contexts,
@@ -225,7 +226,7 @@ fn init_gpu_devices(settings_gpu: &crate::settings::GpuConfig) {
             search_config.min_candidates,
             search_config.max_candidates,
         );
-        set_gpu_search_config(false, None, None, None);
+        set_gpu_search_config(false, false, None, None, None);
     }
 
     let mut gpu_device_manager = GPU_DEVICES_MANAGER.write();

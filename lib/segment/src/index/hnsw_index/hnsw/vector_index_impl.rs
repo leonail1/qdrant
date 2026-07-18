@@ -6,18 +6,51 @@ use common::types::{PointOffsetType, ScoredPointOffset, TelemetryDetail};
 use sparse::common::types::DimId;
 
 use super::HNSWIndex;
+#[cfg(feature = "gpu")]
+use super::search::gpu_filter_cacheable;
 use crate::common::operation_error::{OperationError, OperationResult};
 use crate::common::operation_time_statistics::ScopeDurationMeasurer;
 use crate::data_types::query_context::VectorQueryContext;
+#[cfg(feature = "gpu")]
+use crate::data_types::vectors::VectorInternal;
 use crate::data_types::vectors::{QueryVector, VectorRef};
 use crate::id_tracker::IdTrackerRead;
 use crate::index::hnsw_index::config::HnswGraphConfig;
+#[cfg(feature = "gpu")]
+use crate::index::hnsw_index::gpu::{GpuSearchConfig, get_gpu_search_config};
 use crate::index::query_estimator::adjust_to_available_vectors;
 use crate::index::sample_estimation::sample_check_cardinality;
 use crate::index::{PayloadIndexRead, VectorIndex, VectorIndexRead};
 use crate::telemetry::VectorIndexSearchesTelemetry;
 use crate::types::{Filter, QuantizationSearchParams, SearchParams};
 use crate::vector_storage::VectorStorageRead;
+
+#[cfg(feature = "gpu")]
+fn gpu_router_should_use_plain(
+    config: GpuSearchConfig,
+    cardinality_upper_bound: usize,
+    appendable: bool,
+    cacheable_filter: bool,
+    supported_query: bool,
+) -> bool {
+    config.enabled
+        && config.router_enabled
+        && cardinality_upper_bound <= config.max_candidates
+        && !appendable
+        && cacheable_filter
+        && supported_query
+}
+
+fn force_exact_params(params: Option<&SearchParams>) -> SearchParams {
+    let mut exact_params = params.copied().unwrap_or_default();
+    exact_params.exact = true;
+    exact_params.quantization = Some(QuantizationSearchParams {
+        ignore: true,
+        rescore: Some(false),
+        oversampling: None,
+    });
+    exact_params
+}
 
 impl VectorIndexRead for HNSWIndex {
     fn search(
@@ -38,19 +71,7 @@ impl VectorIndexRead for HNSWIndex {
         let is_hnsw_disabled = self.config.m == 0 && self.config.payload_m.unwrap_or(0) == 0;
         let exact = params.is_some_and(|params| params.exact);
 
-        let exact_params = if exact {
-            params.map(|params| {
-                let mut params = *params;
-                params.quantization = Some(QuantizationSearchParams {
-                    ignore: true,
-                    rescore: Some(false),
-                    oversampling: None,
-                }); // disable quantization for exact search
-                params
-            })
-        } else {
-            None
-        };
+        let exact_params = exact.then(|| force_exact_params(params));
 
         match filter {
             None => {
@@ -118,6 +139,31 @@ impl VectorIndexRead for HNSWIndex {
                     available_vector_count,
                     id_tracker.available_point_count(),
                 );
+
+                #[cfg(feature = "gpu")]
+                {
+                    let supported_query = vectors.iter().all(|vector| {
+                        matches!(vector, QueryVector::Nearest(VectorInternal::Dense(_)))
+                    });
+                    if gpu_router_should_use_plain(
+                        get_gpu_search_config(),
+                        query_cardinality.max,
+                        payload_index.is_appendable(),
+                        gpu_filter_cacheable(query_filter),
+                        supported_query,
+                    ) {
+                        let _timer =
+                            ScopeDurationMeasurer::new(&self.searches_telemetry.exact_filtered);
+                        let router_params = force_exact_params(params);
+                        return self.search_vectors_plain(
+                            vectors,
+                            query_filter,
+                            top,
+                            Some(&router_params),
+                            query_context,
+                        );
+                    }
+                }
 
                 if query_cardinality.max < self.config.full_scan_threshold {
                     // if cardinality is small - use plain index
@@ -214,6 +260,74 @@ impl VectorIndexRead for HNSWIndex {
 
     fn is_index(&self) -> bool {
         true
+    }
+}
+
+#[cfg(all(test, feature = "gpu"))]
+mod gpu_router_tests {
+    use super::*;
+
+    fn config(router_enabled: bool) -> GpuSearchConfig {
+        GpuSearchConfig {
+            enabled: true,
+            router_enabled,
+            min_candidates: 4_096,
+            max_candidates: 200_000,
+            contexts: 8,
+        }
+    }
+
+    #[test]
+    fn router_is_bounded_and_conservative() {
+        assert!(gpu_router_should_use_plain(
+            config(true),
+            100_000,
+            false,
+            true,
+            true,
+        ));
+        assert!(gpu_router_should_use_plain(
+            config(true),
+            1_000,
+            false,
+            true,
+            true,
+        ));
+        assert!(!gpu_router_should_use_plain(
+            config(false),
+            100_000,
+            false,
+            true,
+            true,
+        ));
+        assert!(!gpu_router_should_use_plain(
+            config(true),
+            200_001,
+            false,
+            true,
+            true,
+        ));
+        assert!(!gpu_router_should_use_plain(
+            config(true),
+            100_000,
+            true,
+            true,
+            true,
+        ));
+        assert!(!gpu_router_should_use_plain(
+            config(true),
+            100_000,
+            false,
+            false,
+            true,
+        ));
+        assert!(!gpu_router_should_use_plain(
+            config(true),
+            100_000,
+            false,
+            true,
+            false,
+        ));
     }
 }
 

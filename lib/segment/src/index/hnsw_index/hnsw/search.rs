@@ -26,7 +26,7 @@ use crate::vector_storage::query::DiscoverQuery;
 use crate::vector_storage::{VectorStorageEnum, VectorStorageRead, new_raw_scorer};
 
 #[cfg(feature = "gpu")]
-fn gpu_filter_cacheable(filter: &Filter) -> bool {
+pub(super) fn gpu_filter_cacheable(filter: &Filter) -> bool {
     filter.iter_conditions().all(|condition| match condition {
         Condition::Field(_) | Condition::IsEmpty(_) | Condition::IsNull(_) => true,
         Condition::Nested(nested) => gpu_filter_cacheable(nested.filter()),

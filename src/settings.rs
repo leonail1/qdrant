@@ -203,6 +203,10 @@ pub struct GpuConfig {
     /// Enable exact filtered search over database-owned, GPU-resident indexed segments.
     #[serde(default)]
     pub searching: bool,
+    /// Allow the filtered-search planner to select exact CPU/GPU execution for
+    /// non-exact queries when the bounded predicate cardinality is cheaper than HNSW.
+    #[serde(default)]
+    pub search_router: bool,
     /// Minimum predicate candidates per segment before GPU exact search is considered.
     #[serde(default)]
     #[validate(range(min = 1))]
