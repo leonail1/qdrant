@@ -122,10 +122,13 @@ impl HNSWIndex {
             .deleted_points()
             .zip(vector_query_context.deleted_points_generation())
             .filter(|(deleted, generation)| {
-                *generation != 0
-                    && deleted.len() <= point_count
-                    && id_tracker.deleted_point_count() == 0
-                    && vector_storage.deleted_vector_count() == 0
+                // A generation is only attached by ProxySegment after it has
+                // frozen the wrapped segment and copied its deletion state
+                // into this authoritative read-view mask. Wrapped point and
+                // vector tombstones may therefore be non-zero, but are
+                // already covered by `deleted`; requiring zero here would
+                // reject every dynamic optimizer transition.
+                *generation != 0 && deleted.len() <= point_count
             })
             .map(|(deleted, generation)| GpuVisibilitySnapshot {
                 generation,
