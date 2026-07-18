@@ -34,11 +34,16 @@ shared float tile_scores[TILE_CANDIDATES];
 shared uint tile_candidate_indices[TILE_CANDIDATES];
 
 void load_query_target() {
+    uint query_index = gl_WorkGroupID.y;
 #ifdef SINGLE_SUBGROUP_PER_VECTOR
-    target_cache = query_vector.data[gl_SubgroupInvocationID];
+    uint query_offset = query_index * SUBGROUP_SIZE;
+    target_cache = query_vector.data[query_offset + gl_SubgroupInvocationID];
 #else
+    uint query_offset = query_index * SUBGROUPS_COUNT_PER_VECTOR * SUBGROUP_SIZE;
     for (uint i = 0; i < SUBGROUPS_COUNT_PER_VECTOR; i++) {
-        target_cache[i] = query_vector.data[i * SUBGROUP_SIZE + gl_SubgroupInvocationID];
+        target_cache[i] = query_vector.data[
+            query_offset + i * SUBGROUP_SIZE + gl_SubgroupInvocationID
+        ];
     }
 #endif
 }
@@ -111,6 +116,8 @@ void main() {
             ? INVALID_POINT_ID
             : candidate_ids.data[candidate_index];
         result.score = tile_scores[sorted_index];
-        block_results.data[gl_WorkGroupID.x * BLOCK_TOPK + lane] = result;
+        uint block_count = (candidate_count + TILE_CANDIDATES - 1) / TILE_CANDIDATES;
+        uint output_block = gl_WorkGroupID.y * block_count + gl_WorkGroupID.x;
+        block_results.data[output_block * BLOCK_TOPK + lane] = result;
     }
 }

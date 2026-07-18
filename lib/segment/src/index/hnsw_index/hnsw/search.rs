@@ -35,7 +35,9 @@ pub(super) fn gpu_filter_cacheable(filter: &Filter) -> bool {
     })
 }
 #[cfg(feature = "gpu")]
-use crate::index::hnsw_index::gpu::gpu_exact_search::{GpuExactSearchCache, GpuVisibilitySnapshot};
+use crate::index::hnsw_index::gpu::gpu_exact_search::{
+    GPU_EXACT_SUBMISSION_BATCH_LIMIT, GpuExactSearchCache, GpuVisibilitySnapshot,
+};
 #[cfg(feature = "gpu")]
 use crate::index::hnsw_index::gpu::{GPU_DEVICES_MANAGER, get_gpu_search_config};
 #[cfg(feature = "gpu")]
@@ -166,9 +168,18 @@ impl HNSWIndex {
             return Ok(None);
         };
         let mut results = Vec::with_capacity(dense_queries.len());
-        for query in dense_queries {
-            let Some(result) = cache.search(
-                query,
+        let submission_batch_size = if GpuExactSearchCache::supports_submission_batch(
+            candidates.len(),
+            top,
+            reuse_candidate_buffer,
+        ) {
+            GPU_EXACT_SUBMISSION_BATCH_LIMIT
+        } else {
+            1
+        };
+        for queries in dense_queries.chunks(submission_batch_size) {
+            let Some(mut batch_results) = cache.search_batch(
+                queries,
                 candidates.clone(),
                 top,
                 reuse_candidate_buffer,
@@ -177,7 +188,7 @@ impl HNSWIndex {
             else {
                 return Ok(None);
             };
-            results.push(result);
+            results.append(&mut batch_results);
         }
 
         let postprocess_started = std::time::Instant::now();
@@ -196,6 +207,7 @@ impl HNSWIndex {
         }
         let postprocess_ns = postprocess_started.elapsed().as_nanos() as u64;
         cache.record_outer_breakdown(
+            dense_queries.len(),
             predicate_ns,
             visibility_ns,
             cache_ns,

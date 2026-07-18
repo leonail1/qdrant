@@ -20,6 +20,7 @@ const FILTER_CACHE_MAX_BYTES: usize = 64 * 1024 * 1024;
 const BLOCK_TOPK_MIN_CANDIDATES: usize = 65_536;
 const BLOCK_TOPK_LIMIT: usize = 16;
 const BLOCK_TOPK_TILE_CANDIDATES: usize = 128;
+pub const GPU_EXACT_SUBMISSION_BATCH_LIMIT: usize = 4;
 
 #[derive(Clone, Copy)]
 pub struct GpuVisibilitySnapshot<'a> {
@@ -121,6 +122,8 @@ struct GpuExactSearchStats {
     resident_visibility_misses: AtomicU64,
     context_attempts: AtomicU64,
     context_unavailable: AtomicU64,
+    submission_batches: AtomicU64,
+    submission_queries: AtomicU64,
 }
 
 impl GpuExactSearchStats {
@@ -130,6 +133,7 @@ impl GpuExactSearchStats {
 
     fn record_inner(
         &self,
+        query_count: usize,
         candidates: usize,
         prepare_ns: u64,
         h2d_ns: u64,
@@ -144,7 +148,10 @@ impl GpuExactSearchStats {
         resident_candidate_hit: Option<bool>,
         resident_visibility_hit: Option<bool>,
     ) {
-        Self::add(&self.candidates, candidates as u64);
+        Self::add(
+            &self.candidates,
+            (candidates as u64).saturating_mul(query_count as u64),
+        );
         Self::add(&self.prepare_ns, prepare_ns);
         Self::add(&self.h2d_ns, h2d_ns);
         Self::add(&self.gpu_d2h_ns, gpu_d2h_ns);
@@ -156,19 +163,22 @@ impl GpuExactSearchStats {
         Self::add(&self.resident_candidate_ns, resident_candidate_ns);
         Self::add(&self.resident_visibility_ns, resident_visibility_ns);
         match resident_candidate_hit {
-            Some(true) => Self::add(&self.resident_candidate_hits, 1),
-            Some(false) => Self::add(&self.resident_candidate_misses, 1),
+            Some(true) => Self::add(&self.resident_candidate_hits, query_count as u64),
+            Some(false) => Self::add(&self.resident_candidate_misses, query_count as u64),
             None => {}
         }
         match resident_visibility_hit {
-            Some(true) => Self::add(&self.resident_visibility_hits, 1),
-            Some(false) => Self::add(&self.resident_visibility_misses, 1),
+            Some(true) => Self::add(&self.resident_visibility_hits, query_count as u64),
+            Some(false) => Self::add(&self.resident_visibility_misses, query_count as u64),
             None => {}
         }
+        Self::add(&self.submission_batches, 1);
+        Self::add(&self.submission_queries, query_count as u64);
     }
 
     fn record_outer(
         &self,
+        query_count: usize,
         predicate_ns: u64,
         visibility_ns: u64,
         cache_ns: u64,
@@ -180,14 +190,17 @@ impl GpuExactSearchStats {
         Self::add(&self.cache_ns, cache_ns);
         Self::add(&self.postprocess_ns, postprocess_ns);
         match filter_cache_hit {
-            Some(true) => Self::add(&self.filter_cache_hits, 1),
-            Some(false) => Self::add(&self.filter_cache_misses, 1),
+            Some(true) => Self::add(&self.filter_cache_hits, query_count as u64),
+            Some(false) => Self::add(&self.filter_cache_misses, query_count as u64),
             None => {}
         }
 
-        let sequence = self.total_queries.fetch_add(1, Ordering::Relaxed) + 1;
-        self.window_queries.fetch_add(1, Ordering::Relaxed);
-        if sequence != 1 && !sequence.is_multiple_of(1_024) {
+        let query_count = query_count.max(1) as u64;
+        let previous_sequence = self.total_queries.fetch_add(query_count, Ordering::Relaxed);
+        let sequence = previous_sequence + query_count;
+        self.window_queries
+            .fetch_add(query_count, Ordering::Relaxed);
+        if previous_sequence != 0 && previous_sequence / 1_024 == sequence / 1_024 {
             return;
         }
 
@@ -239,6 +252,13 @@ impl GpuExactSearchStats {
         } else {
             context_unavailable as f64 / context_attempts as f64
         };
+        let submission_batches = take(&self.submission_batches);
+        let submission_queries = take(&self.submission_queries);
+        let average_submission_batch = if submission_batches == 0 {
+            0.0
+        } else {
+            submission_queries as f64 / submission_batches as f64
+        };
         let average_us = |value: u64| value as f64 / queries as f64 / 1_000.0;
 
         log::info!(
@@ -250,7 +270,9 @@ impl GpuExactSearchStats {
              postprocess_us={:.3}, filter_cache_hit_rate={:.3}, \
              resident_candidate_hit_rate={:.3}, resident_visibility_hit_rate={:.3}, \
              context_attempts={context_attempts}, context_unavailable={context_unavailable}, \
-             context_unavailable_rate={context_unavailable_rate:.3}",
+             context_unavailable_rate={context_unavailable_rate:.3}, \
+             submission_batches={submission_batches}, submission_queries={submission_queries}, \
+             average_submission_batch={average_submission_batch:.3}",
             candidates as f64 / queries as f64,
             average_us(predicate_ns),
             average_us(visibility_ns),
@@ -404,9 +426,17 @@ impl GpuExactSearchContext {
     ) -> OperationResult<Self> {
         let device = vector_storage.device();
         let candidate_bytes = candidate_capacity * std::mem::size_of::<PointOffsetType>();
-        let score_bytes = candidate_capacity * std::mem::size_of::<f32>();
+        let scalar_score_bytes = candidate_capacity * std::mem::size_of::<f32>();
+        let batched_block_score_bytes = candidate_capacity
+            .div_ceil(BLOCK_TOPK_TILE_CANDIDATES)
+            .saturating_mul(BLOCK_TOPK_LIMIT)
+            .saturating_mul(std::mem::size_of::<ScoredPointOffset>())
+            .saturating_mul(GPU_EXACT_SUBMISSION_BATCH_LIMIT);
+        let score_bytes = scalar_score_bytes.max(batched_block_score_bytes);
         let query_capacity = vector_storage.vector_capacity();
-        let query_bytes = query_capacity * std::mem::size_of::<f32>();
+        let query_bytes = query_capacity
+            .saturating_mul(GPU_EXACT_SUBMISSION_BATCH_LIMIT)
+            .saturating_mul(std::mem::size_of::<f32>());
         let visibility_capacity_words = vector_storage
             .num_vectors()
             .div_ceil(u32::BITS as usize)
@@ -485,9 +515,9 @@ impl GpuExactSearchContext {
         })
     }
 
-    fn search(
+    fn search_batch(
         &mut self,
-        query: &[f32],
+        queries: &[&[f32]],
         candidates: &[PointOffsetType],
         top: usize,
         resident_candidate_buffer: Option<Arc<gpu::Buffer>>,
@@ -496,28 +526,39 @@ impl GpuExactSearchContext {
         resident_visibility_hit: Option<bool>,
         resident_candidate_ns: u64,
         resident_visibility_ns: u64,
-    ) -> OperationResult<Vec<ScoredPointOffset>> {
+    ) -> OperationResult<Vec<Vec<ScoredPointOffset>>> {
         if candidates.len() > self.candidate_capacity {
             return Err(OperationError::service_error(
                 "GPU exact candidate capacity exceeded",
             ));
         }
-        if query.len() != self.vector_storage.dim() {
+        if queries.is_empty() || queries.len() > GPU_EXACT_SUBMISSION_BATCH_LIMIT {
+            return Err(OperationError::service_error(
+                "GPU exact query batch capacity exceeded",
+            ));
+        }
+        if queries
+            .iter()
+            .any(|query| query.len() != self.vector_storage.dim())
+        {
             return Err(OperationError::service_error(
                 "GPU exact query dimension mismatch",
             ));
         }
         if candidates.is_empty() || top == 0 {
-            return Ok(Vec::new());
+            return Ok((0..queries.len()).map(|_| Vec::new()).collect());
         }
 
         let prepare_started = std::time::Instant::now();
-        let mut padded_query = vec![0.0f32; self.query_capacity];
-        padded_query[..query.len()].copy_from_slice(query);
+        let mut padded_queries = vec![0.0f32; self.query_capacity * queries.len()];
+        for (query_index, query) in queries.iter().enumerate() {
+            let start = query_index * self.query_capacity;
+            padded_queries[start..start + query.len()].copy_from_slice(query);
+        }
         if resident_candidate_buffer.is_none() {
             self.candidate_staging.upload(candidates, 0)?;
         }
-        self.query_staging.upload(padded_query.as_slice(), 0)?;
+        self.query_staging.upload(padded_queries.as_slice(), 0)?;
         let has_visibility = visibility_buffer.is_some();
         let descriptor_set = match (resident_candidate_buffer, visibility_buffer) {
             (None, None) => self.descriptor_set.clone(),
@@ -546,12 +587,18 @@ impl GpuExactSearchContext {
         let use_block_topk = resident_candidate_hit.is_some()
             && candidates.len() >= BLOCK_TOPK_MIN_CANDIDATES
             && top <= BLOCK_TOPK_LIMIT;
+        if queries.len() > 1 && !use_block_topk {
+            return Err(OperationError::service_error(
+                "GPU exact multi-query submission requires block top-k",
+            ));
+        }
         let block_count = candidates.len().div_ceil(BLOCK_TOPK_TILE_CANDIDATES);
-        let output_count = if use_block_topk {
+        let output_count_per_query = if use_block_topk {
             block_count * BLOCK_TOPK_LIMIT
         } else {
             candidates.len()
         };
+        let output_count = output_count_per_query * queries.len();
         let output_bytes = if use_block_topk {
             output_count * std::mem::size_of::<ScoredPointOffset>()
         } else {
@@ -577,7 +624,7 @@ impl GpuExactSearchContext {
             self.query_buffer.clone(),
             0,
             0,
-            padded_query.len() * std::mem::size_of::<f32>(),
+            padded_queries.len() * std::mem::size_of::<f32>(),
         )?;
         self.context.barrier_buffers(&uploaded_buffers)?;
         let pipeline = match (has_visibility, use_block_topk) {
@@ -596,7 +643,7 @@ impl GpuExactSearchContext {
             } else {
                 candidates.len()
             },
-            1,
+            queries.len(),
             1,
         )?;
         self.context
@@ -630,21 +677,28 @@ impl GpuExactSearchContext {
             .transpose()?;
         let download_ns = download_started.elapsed().as_nanos() as u64;
         let cpu_topk_started = std::time::Instant::now();
-        let mut queue = TopK::new(top);
+        let mut results = Vec::with_capacity(queries.len());
         if let Some(block_results) = block_results {
-            for point in block_results {
-                if point.idx != PointOffsetType::MAX {
-                    queue.push(point);
+            for query_results in block_results.chunks_exact(output_count_per_query) {
+                let mut queue = TopK::new(top);
+                for &point in query_results {
+                    if point.idx != PointOffsetType::MAX {
+                        queue.push(point);
+                    }
                 }
+                results.push(queue.into_vec());
             }
         } else if let Some(scores) = scores {
+            debug_assert_eq!(queries.len(), 1);
+            let mut queue = TopK::new(top);
             for (&idx, score) in candidates.iter().zip(scores) {
                 queue.push(ScoredPointOffset { idx, score });
             }
+            results.push(queue.into_vec());
         }
-        let result = queue.into_vec();
         let cpu_topk_ns = cpu_topk_started.elapsed().as_nanos() as u64;
         self.stats.record_inner(
+            queries.len(),
             candidates.len(),
             prepare_ns,
             h2d_ns,
@@ -659,7 +713,7 @@ impl GpuExactSearchContext {
             resident_candidate_hit,
             resident_visibility_hit,
         );
-        Ok(result)
+        Ok(results)
     }
 
     fn upload_resident_candidates(
@@ -733,6 +787,16 @@ impl fmt::Debug for GpuExactSearchCache {
 }
 
 impl GpuExactSearchCache {
+    pub fn supports_submission_batch(
+        candidate_count: usize,
+        top: usize,
+        reuse_candidate_buffer: bool,
+    ) -> bool {
+        reuse_candidate_buffer
+            && candidate_count >= BLOCK_TOPK_MIN_CANDIDATES
+            && top <= BLOCK_TOPK_LIMIT
+    }
+
     pub fn clear_resident_candidates(&self) {
         self.resident_candidates.lock().clear();
         self.resident_visibility.lock().clear();
@@ -851,6 +915,25 @@ impl GpuExactSearchCache {
         reuse_candidate_buffer: bool,
         visibility: Option<GpuVisibilitySnapshot<'_>>,
     ) -> OperationResult<Option<Vec<ScoredPointOffset>>> {
+        let queries = [query];
+        self.search_batch(
+            &queries,
+            candidates,
+            top,
+            reuse_candidate_buffer,
+            visibility,
+        )
+        .map(|batch| batch.map(|mut results| results.pop().unwrap_or_default()))
+    }
+
+    pub fn search_batch(
+        &self,
+        queries: &[&[f32]],
+        candidates: Arc<Vec<PointOffsetType>>,
+        top: usize,
+        reuse_candidate_buffer: bool,
+        visibility: Option<GpuVisibilitySnapshot<'_>>,
+    ) -> OperationResult<Option<Vec<Vec<ScoredPointOffset>>>> {
         GpuExactSearchStats::add(&self.stats.context_attempts, 1);
         let Some(mut context) = self.contexts.lock().pop() else {
             GpuExactSearchStats::add(&self.stats.context_unavailable, 1);
@@ -901,8 +984,8 @@ impl GpuExactSearchCache {
                 (None, None)
             };
             let resident_visibility_ns = resident_visibility_started.elapsed().as_nanos() as u64;
-            context.search(
-                query,
+            context.search_batch(
+                queries,
                 candidates.as_slice(),
                 top,
                 resident_candidate_buffer,
@@ -919,6 +1002,7 @@ impl GpuExactSearchCache {
 
     pub fn record_outer_breakdown(
         &self,
+        query_count: usize,
         predicate_ns: u64,
         visibility_ns: u64,
         cache_ns: u64,
@@ -926,6 +1010,7 @@ impl GpuExactSearchCache {
         filter_cache_hit: Option<bool>,
     ) {
         self.stats.record_outer(
+            query_count,
             predicate_ns,
             visibility_ns,
             cache_ns,
@@ -1106,6 +1191,7 @@ mod tests {
         const DIM: usize = 128;
         const COUNT: usize = BLOCK_TOPK_MIN_CANDIDATES;
         const TARGET: usize = 12_345;
+        const TARGET_TWO: usize = 54_321;
         const TOP: usize = 10;
 
         let vectors = (0..COUNT)
@@ -1166,6 +1252,43 @@ mod tests {
             }
         }
 
+        let query_two = vectors[TARGET_TWO].clone();
+        let mut expected_two = vectors
+            .iter()
+            .enumerate()
+            .map(|(idx, vector)| {
+                let score = -vector
+                    .iter()
+                    .zip(query_two.iter())
+                    .map(|(left, right)| (left - right) * (left - right))
+                    .sum::<f32>();
+                ScoredPointOffset {
+                    idx: idx as PointOffsetType,
+                    score,
+                }
+            })
+            .collect::<Vec<_>>();
+        expected_two.sort_by(|left, right| {
+            right
+                .score
+                .total_cmp(&left.score)
+                .then_with(|| left.idx.cmp(&right.idx))
+        });
+        let batch_queries = [query.as_slice(), query_two.as_slice()];
+        let batch_results = cache
+            .search_batch(&batch_queries, candidates.clone(), TOP, true, None)
+            .unwrap()
+            .unwrap();
+        assert_eq!(batch_results.len(), 2);
+        for (actual, expected) in batch_results[0].iter().zip(&expected[..TOP]) {
+            assert_eq!(actual.idx, expected.idx);
+            assert!((actual.score - expected.score).abs() < 1e-4);
+        }
+        for (actual, expected) in batch_results[1].iter().zip(&expected_two[..TOP]) {
+            assert_eq!(actual.idx, expected.idx);
+            assert!((actual.score - expected.score).abs() < 1e-4);
+        }
+
         let mut deleted = BitVec::repeat(false, COUNT);
         for point in expected.iter().take(7) {
             deleted.set(point.idx as usize, true);
@@ -1193,6 +1316,39 @@ mod tests {
                 assert_eq!(actual.idx, expected.idx);
                 assert!((actual.score - expected.score).abs() < 1e-4);
             }
+        }
+
+        let visible_expected_two = expected_two
+            .iter()
+            .filter(|point| !deleted[point.idx as usize])
+            .collect::<Vec<_>>();
+        let visible_batch_results = cache
+            .search_batch(
+                &batch_queries,
+                candidates,
+                TOP,
+                true,
+                Some(GpuVisibilitySnapshot {
+                    generation: 12,
+                    deleted: &deleted,
+                    point_count: COUNT,
+                }),
+            )
+            .unwrap()
+            .unwrap();
+        for (actual, expected) in visible_batch_results[0]
+            .iter()
+            .zip(visible_expected[..TOP].iter().copied())
+        {
+            assert_eq!(actual.idx, expected.idx);
+            assert!((actual.score - expected.score).abs() < 1e-4);
+        }
+        for (actual, expected) in visible_batch_results[1]
+            .iter()
+            .zip(visible_expected_two[..TOP].iter().copied())
+        {
+            assert_eq!(actual.idx, expected.idx);
+            assert!((actual.score - expected.score).abs() < 1e-4);
         }
     }
 }
