@@ -517,11 +517,17 @@ impl HNSWIndex {
         #[cfg(feature = "gpu")]
         let (filtered_points, predicate_ns, filter_cache_hit) = {
             let predicate_started = std::time::Instant::now();
+            let query_cardinality =
+                payload_index.with_view(|v| v.estimate_cardinality(filter, hw_counter))?;
             // The predicate projection belongs to the database execution
             // layer, not to the GPU exact kernel. Reuse it for stock-compatible
             // CPU plain scoring as well, so a GPU miss or cost-model fallback
-            // does not re-run the payload iterator on every query.
-            let cacheable = get_gpu_search_config().enabled
+            // does not re-run the payload iterator on every query. Keep tiny
+            // predicates on Qdrant's native bitmap iterator: caching thousands
+            // of distinct, cheap projections costs more than recomputing them.
+            let config = get_gpu_search_config();
+            let cacheable = config.enabled
+                && query_cardinality.max >= config.min_candidates
                 && !payload_index.is_appendable()
                 && gpu_filter_cacheable(filter);
             let payload_epoch = payload_index.mutation_epoch();
@@ -534,7 +540,6 @@ impl HNSWIndex {
             } else {
                 // Assume query is already estimated to be small enough so we can iterate over all matched ids.
                 let candidates = Arc::new(payload_index.with_view(|v| {
-                    let query_cardinality = v.estimate_cardinality(filter, hw_counter)?;
                     v.iter_filtered_points(
                         filter,
                         &query_cardinality,
