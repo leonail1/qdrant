@@ -18,6 +18,9 @@ pub use descriptor_set_layout::*;
 pub mod buffer;
 pub use buffer::*;
 
+pub mod buffer_telemetry;
+pub use buffer_telemetry::*;
+
 pub mod device;
 pub use device::*;
 

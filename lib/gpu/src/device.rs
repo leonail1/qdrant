@@ -1,11 +1,14 @@
 use std::ffi::{CString, c_char};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use ash::vk;
 use gpu_allocator::vulkan::{Allocation, AllocationCreateDesc, Allocator, AllocatorCreateDesc};
 use parking_lot::Mutex;
 
 use crate::*;
+
+static NEXT_DEVICE_TELEMETRY_ID: AtomicU64 = AtomicU64::new(1);
 
 /// GPU device structure.
 /// It's a wrapper around Vulkan device.
@@ -18,6 +21,11 @@ pub struct Device {
 
     /// Hardware device name.
     name: String,
+
+    /// Process-local identity used to attribute GPU resources to this logical
+    /// Vulkan device. Multiple logical devices may refer to the same physical
+    /// GPU when parallel index queues are configured.
+    telemetry_id: u64,
 
     /// GPU memory allocator from `gpu-allocator` crate.
     /// It's an Option because of drop order. We need to drop it before the device.
@@ -301,9 +309,7 @@ impl Device {
             }
         };
 
-        let compute_queue_locks = (0..compute_queues.len())
-            .map(|_| Mutex::new(()))
-            .collect();
+        let compute_queue_locks = (0..compute_queues.len()).map(|_| Mutex::new(())).collect();
 
         Ok(Arc::new(Device {
             instance: instance.clone(),
@@ -318,6 +324,7 @@ impl Device {
             is_dynamic_subgroup_size,
             queue_index,
             name: vk_physical_device.name.clone(),
+            telemetry_id: NEXT_DEVICE_TELEMETRY_ID.fetch_add(1, Ordering::Relaxed),
             has_half_precision,
         }))
     }
@@ -409,6 +416,17 @@ impl Device {
 
     pub fn name(&self) -> &str {
         &self.name
+    }
+
+    /// Stable for the lifetime of this process and unique across logical
+    /// Vulkan devices created by Qdrant.
+    pub fn telemetry_id(&self) -> u64 {
+        self.telemetry_id
+    }
+
+    /// Queue selector supplied when this logical device was created.
+    pub fn telemetry_queue_index(&self) -> usize {
+        self.queue_index
     }
 
     fn check_extensions_list(

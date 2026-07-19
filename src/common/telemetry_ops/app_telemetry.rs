@@ -57,6 +57,8 @@ pub struct RunningEnvironmentTelemetry {
     cpu_endian: Option<CpuEndian>,
     #[serde(skip_serializing_if = "Option::is_none")]
     gpu_devices: Option<Vec<GpuDeviceTelemetry>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    gpu_buffer_memory: Option<Vec<GpuBufferDeviceMemoryTelemetry>>,
 }
 
 #[derive(Serialize, Clone, Debug, JsonSchema, Anonymize)]
@@ -224,6 +226,18 @@ fn get_system_data() -> RunningEnvironmentTelemetry {
     #[cfg(not(feature = "gpu"))]
     let gpu_devices = None;
 
+    #[cfg(feature = "gpu")]
+    let gpu_buffer_memory = Some(
+        gpu::buffer_telemetry_snapshot()
+            .devices
+            .into_iter()
+            .map(GpuBufferDeviceMemoryTelemetry::from)
+            .collect(),
+    );
+
+    #[cfg(not(feature = "gpu"))]
+    let gpu_buffer_memory = None;
+
     RunningEnvironmentTelemetry {
         distribution,
         distribution_version,
@@ -235,6 +249,7 @@ fn get_system_data() -> RunningEnvironmentTelemetry {
         cpu_flags: cpu_flags.join(","),
         cpu_endian: Some(CpuEndian::current()),
         gpu_devices,
+        gpu_buffer_memory,
     }
 }
 
@@ -263,4 +278,97 @@ impl CpuEndian {
 pub struct GpuDeviceTelemetry {
     #[anonymize(false)]
     pub name: String,
+}
+
+#[derive(Serialize, Clone, Debug, JsonSchema, Anonymize)]
+pub struct GpuBufferStatsTelemetry {
+    #[anonymize(false)]
+    pub current_logical_bytes: u64,
+    #[anonymize(false)]
+    pub current_allocation_bytes: u64,
+    #[anonymize(false)]
+    pub peak_logical_bytes: u64,
+    #[anonymize(false)]
+    pub peak_allocation_bytes: u64,
+    #[anonymize(false)]
+    pub live_buffers: u64,
+    #[anonymize(false)]
+    pub peak_live_buffers: u64,
+    #[anonymize(false)]
+    pub allocation_count: u64,
+    #[anonymize(false)]
+    pub free_count: u64,
+}
+
+#[cfg(feature = "gpu")]
+impl From<gpu::BufferTelemetryStats> for GpuBufferStatsTelemetry {
+    fn from(value: gpu::BufferTelemetryStats) -> Self {
+        Self {
+            current_logical_bytes: value.current_logical_bytes,
+            current_allocation_bytes: value.current_allocation_bytes,
+            peak_logical_bytes: value.peak_logical_bytes,
+            peak_allocation_bytes: value.peak_allocation_bytes,
+            live_buffers: value.live_buffers,
+            peak_live_buffers: value.peak_live_buffers,
+            allocation_count: value.allocation_count,
+            free_count: value.free_count,
+        }
+    }
+}
+
+#[derive(Serialize, Clone, Debug, JsonSchema, Anonymize)]
+pub struct GpuBufferTypeMemoryTelemetry {
+    #[anonymize(false)]
+    pub buffer_type: String,
+    pub stats: GpuBufferStatsTelemetry,
+}
+
+#[derive(Serialize, Clone, Debug, JsonSchema, Anonymize)]
+pub struct GpuBufferLabelMemoryTelemetry {
+    #[anonymize(false)]
+    pub label: String,
+    #[anonymize(false)]
+    pub buffer_type: String,
+    pub stats: GpuBufferStatsTelemetry,
+}
+
+#[derive(Serialize, Clone, Debug, JsonSchema, Anonymize)]
+pub struct GpuBufferDeviceMemoryTelemetry {
+    #[anonymize(false)]
+    pub device_id: u64,
+    #[anonymize(false)]
+    pub device_name: String,
+    pub queue_index: usize,
+    pub total: GpuBufferStatsTelemetry,
+    pub by_type: Vec<GpuBufferTypeMemoryTelemetry>,
+    pub by_label: Vec<GpuBufferLabelMemoryTelemetry>,
+}
+
+#[cfg(feature = "gpu")]
+impl From<gpu::BufferDeviceTelemetry> for GpuBufferDeviceMemoryTelemetry {
+    fn from(value: gpu::BufferDeviceTelemetry) -> Self {
+        Self {
+            device_id: value.device_id,
+            device_name: value.device_name,
+            queue_index: value.queue_index,
+            total: value.total.into(),
+            by_type: value
+                .by_type
+                .into_iter()
+                .map(|(buffer_type, stats)| GpuBufferTypeMemoryTelemetry {
+                    buffer_type: format!("{buffer_type:?}"),
+                    stats: stats.into(),
+                })
+                .collect(),
+            by_label: value
+                .by_label
+                .into_iter()
+                .map(|entry| GpuBufferLabelMemoryTelemetry {
+                    label: entry.label,
+                    buffer_type: format!("{:?}", entry.buffer_type),
+                    stats: entry.stats.into(),
+                })
+                .collect(),
+        }
+    }
 }

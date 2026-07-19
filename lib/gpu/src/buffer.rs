@@ -23,15 +23,21 @@ pub struct Buffer {
     /// Buffer type. It defines how the buffer can be used.
     buffer_type: BufferType,
 
+    /// Stable allocation label used by the internal GPU resource ledger.
+    name: String,
+
     /// Buffer size in bytes.
     size: usize,
+
+    /// Size of the Vulkan allocation after device alignment.
+    allocation_size: usize,
 
     /// GPU memory allocation that backs the buffer.
     allocation: Mutex<Allocation>,
 }
 
 /// Buffer type defines how the buffer can be used.
-#[derive(PartialEq, Eq, Clone, Copy)]
+#[derive(Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Clone, Copy)]
 pub enum BufferType {
     /// Uniform data for a shader.
     Uniform,
@@ -61,6 +67,8 @@ impl Buffer {
                 "Zero-sized GPU buffers are not supported".to_string(),
             ));
         }
+
+        let name = name.as_ref().to_owned();
 
         // Vulkan API requires buffer usage flags to be specified during the buffer creation.
         let vk_usage_flags = match buffer_type {
@@ -106,7 +114,7 @@ impl Buffer {
         let buffer_allocation_requirements =
             unsafe { device.vk_device().get_buffer_memory_requirements(vk_buffer) };
         let allocation_result = device.allocate(&AllocationCreateDesc {
-            name: name.as_ref(),
+            name: &name,
             requirements: buffer_allocation_requirements,
             location,
             linear: true, // Buffers are always linear.
@@ -148,17 +156,36 @@ impl Buffer {
             return Err(GpuError::from(e));
         }
 
-        Ok(Arc::new(Self {
+        let allocation_size = allocation.size() as usize;
+        let buffer = Arc::new(Self {
             device,
             vk_buffer,
             buffer_type,
+            name,
             size,
+            allocation_size,
             allocation: Mutex::new(allocation),
-        }))
+        });
+        crate::record_buffer_allocation(
+            buffer.device.as_ref(),
+            &buffer.name,
+            buffer.buffer_type,
+            buffer.size,
+            buffer.allocation_size,
+        );
+        Ok(buffer)
     }
 
     pub fn size(&self) -> usize {
         self.size
+    }
+
+    pub fn allocation_size(&self) -> usize {
+        self.allocation_size
+    }
+
+    pub fn name(&self) -> &str {
+        &self.name
     }
 
     pub fn vk_buffer(&self) -> vk::Buffer {
@@ -263,6 +290,13 @@ impl Drop for Buffer {
                     .destroy_buffer(self.vk_buffer, self.device.cpu_allocation_callbacks())
             };
             self.vk_buffer = vk::Buffer::null();
+            crate::record_buffer_free(
+                self.device.telemetry_id(),
+                &self.name,
+                self.buffer_type,
+                self.size,
+                self.allocation_size,
+            );
         }
     }
 }
