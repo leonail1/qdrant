@@ -29,6 +29,7 @@ pub struct GpuLinks {
     max_patched_points: usize,
     device: Arc<gpu::Device>,
     links_buffer: Arc<gpu::Buffer>,
+    offsets_buffer: Option<Arc<gpu::Buffer>>,
     params_buffer: Arc<gpu::Buffer>,
     patch_buffer: Option<Arc<gpu::Buffer>>,
     patched_points: Vec<(PointOffsetType, usize)>,
@@ -46,10 +47,14 @@ impl ShaderBuilderParameters for GpuLinks {
 
     fn shader_defines(&self) -> HashMap<String, Option<String>> {
         let mut defines = HashMap::new();
-        defines.insert(
-            "LINKS_CAPACITY".to_owned(),
-            Some(self.links_capacity.to_string()),
-        );
+        if self.offsets_buffer.is_some() {
+            defines.insert("LINKS_COMPACT".to_owned(), None);
+        } else {
+            defines.insert(
+                "LINKS_CAPACITY".to_owned(),
+                Some(self.links_capacity.to_string()),
+            );
+        }
         defines
     }
 }
@@ -134,9 +139,188 @@ impl GpuLinks {
             max_patched_points,
             device,
             links_buffer,
+            offsets_buffer: None,
             params_buffer,
             patch_buffer: Some(patch_buffer),
             patched_points: vec![],
+            descriptor_set_layout,
+            descriptor_set,
+        })
+    }
+
+    /// Build an immutable CSR projection for filtered graph search. GPU HNSW
+    /// construction continues to use [`Self::new`]'s mutable fixed-width
+    /// representation.
+    pub fn new_compact(
+        device: Arc<gpu::Device>,
+        graph: &impl GraphLayersBase,
+        points_count: usize,
+        stopped: &AtomicBool,
+    ) -> OperationResult<Self> {
+        let mut offsets = Vec::with_capacity(points_count + 1);
+        offsets.push(0u32);
+        let mut max_links = 0usize;
+        for point_id in 0..points_count {
+            if point_id % 4_096 == 0 {
+                check_stopped(stopped)?;
+            }
+            let mut links_count = 0usize;
+            graph.for_each_link(point_id as PointOffsetType, 0, |_| links_count += 1);
+            max_links = max_links.max(links_count);
+            let next_offset = (*offsets.last().unwrap() as usize)
+                .checked_add(links_count)
+                .and_then(|offset| u32::try_from(offset).ok())
+                .ok_or_else(|| {
+                    OperationError::service_error(
+                        "GPU compact graph has more links than u32 offsets can address",
+                    )
+                })?;
+            offsets.push(next_offset);
+        }
+        let total_links = usize::try_from(*offsets.last().unwrap()).unwrap();
+        if max_links == 0 || total_links == 0 {
+            return Err(OperationError::service_error(
+                "GPU filtered graph has no level-0 links",
+            ));
+        }
+
+        let offsets_bytes = std::mem::size_of_val(offsets.as_slice());
+        let links_bytes = total_links
+            .checked_mul(std::mem::size_of::<PointOffsetType>())
+            .ok_or_else(|| OperationError::service_error("GPU compact links size overflow"))?;
+        let dense_bytes = points_count
+            .checked_mul(max_links + 1)
+            .and_then(|count| count.checked_mul(std::mem::size_of::<PointOffsetType>()))
+            .ok_or_else(|| OperationError::service_error("GPU dense links size overflow"))?;
+
+        let links_buffer = gpu::Buffer::new(
+            device.clone(),
+            "Compact links neighbors",
+            gpu::BufferType::Storage,
+            links_bytes,
+        )?;
+        let offsets_buffer = gpu::Buffer::new(
+            device.clone(),
+            "Compact links offsets",
+            gpu::BufferType::Storage,
+            offsets_bytes,
+        )?;
+        let params_buffer = gpu::Buffer::new(
+            device.clone(),
+            "Links params buffer",
+            gpu::BufferType::Uniform,
+            std::mem::size_of::<GpuLinksParamsBuffer>(),
+        )?;
+        let upload_buffer = gpu::Buffer::new(
+            device.clone(),
+            "Compact links upload",
+            gpu::BufferType::CpuToGpu,
+            LINKS_TRANSFER_BUFFER_SIZE,
+        )?;
+        let mut upload_context = gpu::Context::new(device.clone())?;
+
+        let params = GpuLinksParamsBuffer {
+            m: graph.get_m(0) as u32,
+            links_capacity: 0,
+        };
+        upload_buffer.upload(&params, 0)?;
+        upload_context.copy_gpu_buffer(
+            upload_buffer.clone(),
+            params_buffer.clone(),
+            0,
+            0,
+            std::mem::size_of::<GpuLinksParamsBuffer>(),
+        )?;
+        upload_context.run()?;
+        upload_context.wait_finish(GPU_TIMEOUT)?;
+
+        let transfer_elements = LINKS_TRANSFER_BUFFER_SIZE / std::mem::size_of::<u32>();
+        for (chunk_index, chunk) in offsets.chunks(transfer_elements).enumerate() {
+            upload_u32_slice(
+                &mut upload_context,
+                &upload_buffer,
+                &offsets_buffer,
+                chunk,
+                chunk_index * transfer_elements,
+            )?;
+        }
+
+        let mut links_chunk = Vec::with_capacity(transfer_elements);
+        let mut uploaded_links = 0usize;
+        for point_id in 0..points_count {
+            if point_id % 4_096 == 0 {
+                check_stopped(stopped)?;
+            }
+            let expected_links = offsets[point_id + 1] as usize - offsets[point_id] as usize;
+            if expected_links > transfer_elements {
+                return Err(OperationError::service_error(
+                    "A GPU compact adjacency list exceeds the staging buffer",
+                ));
+            }
+            if !links_chunk.is_empty()
+                && links_chunk.len().saturating_add(expected_links) > transfer_elements
+            {
+                upload_u32_slice(
+                    &mut upload_context,
+                    &upload_buffer,
+                    &links_buffer,
+                    &links_chunk,
+                    uploaded_links,
+                )?;
+                uploaded_links += links_chunk.len();
+                links_chunk.clear();
+            }
+            let before = links_chunk.len();
+            graph.for_each_link(point_id as PointOffsetType, 0, |link| {
+                links_chunk.push(link)
+            });
+            if links_chunk.len() - before != expected_links {
+                return Err(OperationError::service_error(
+                    "GPU graph changed while building the compact projection",
+                ));
+            }
+        }
+        if !links_chunk.is_empty() {
+            upload_u32_slice(
+                &mut upload_context,
+                &upload_buffer,
+                &links_buffer,
+                &links_chunk,
+                uploaded_links,
+            )?;
+            uploaded_links += links_chunk.len();
+        }
+        if uploaded_links != total_links {
+            return Err(OperationError::service_error(
+                "GPU compact graph upload did not cover every link",
+            ));
+        }
+
+        let descriptor_set_layout = gpu::DescriptorSetLayout::builder()
+            .add_uniform_buffer(0)
+            .add_storage_buffer(1)
+            .add_storage_buffer(2)
+            .build(device.clone())?;
+        let descriptor_set = gpu::DescriptorSet::builder(descriptor_set_layout.clone())
+            .add_uniform_buffer(0, params_buffer.clone())
+            .add_storage_buffer(1, links_buffer.clone())
+            .add_storage_buffer(2, offsets_buffer.clone())
+            .build()?;
+
+        log::info!(
+            "GPU compact links projection: points={points_count}, links={total_links}, max_degree={max_links}, compact_bytes={}, dense_bytes={dense_bytes}",
+            links_bytes + offsets_bytes,
+        );
+        Ok(Self {
+            m: graph.get_m(0),
+            links_capacity: 0,
+            max_patched_points: 0,
+            device,
+            links_buffer,
+            offsets_buffer: Some(offsets_buffer),
+            params_buffer,
+            patch_buffer: None,
+            patched_points: Vec::new(),
             descriptor_set_layout,
             descriptor_set,
         })
@@ -413,4 +597,34 @@ impl GpuLinks {
             OperationError::service_error("GPU links patch buffer has already been released")
         })
     }
+}
+
+fn upload_u32_slice(
+    context: &mut gpu::Context,
+    staging: &Arc<gpu::Buffer>,
+    target: &Arc<gpu::Buffer>,
+    values: &[u32],
+    target_element_offset: usize,
+) -> OperationResult<()> {
+    let bytes = std::mem::size_of_val(values);
+    if bytes > staging.size() {
+        return Err(OperationError::service_error(
+            "GPU compact links upload chunk exceeds the staging buffer",
+        ));
+    }
+    let target_byte_offset = target_element_offset
+        .checked_mul(std::mem::size_of::<u32>())
+        .filter(|offset| offset.saturating_add(bytes) <= target.size())
+        .ok_or_else(|| OperationError::service_error("GPU compact links upload is out of range"))?;
+    staging.upload(values, 0)?;
+    context.copy_gpu_buffer(
+        staging.clone(),
+        target.clone(),
+        0,
+        target_byte_offset,
+        bytes,
+    )?;
+    context.run()?;
+    context.wait_finish(GPU_TIMEOUT)?;
+    Ok(())
 }

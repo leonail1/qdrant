@@ -97,17 +97,12 @@ impl GpuFilteredGraphSearchContext {
                 "GPU filtered graph capacities are inconsistent",
             ));
         }
-        let max_links = GpuLinks::max_links_on_level(graph, point_count, 0);
-        if max_links == 0 {
-            return Err(OperationError::service_error(
-                "GPU filtered graph has no level-0 links",
-            ));
-        }
-        let mut links = GpuLinks::new(device.clone(), graph.get_m(0), max_links, point_count)?;
-        let mut upload_context = gpu::Context::new(device.clone())?;
-        links.upload_graph_layer(0, graph, point_count, &mut upload_context, stopped)?;
-        links.release_patch_buffer()?;
-        let links = Arc::new(links);
+        let links = Arc::new(GpuLinks::new_compact(
+            device.clone(),
+            graph,
+            point_count,
+            stopped,
+        )?);
 
         Self::new_with_resources(device, vector_storage, links, point_count, ef, 0)
     }

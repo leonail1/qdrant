@@ -19,16 +19,51 @@ buffer Links {
 
 #define LEVEL_M links_params.m
 
+#ifdef LINKS_COMPACT
+
+layout(set = LINKS_LAYOUT_SET, binding = 2)
+readonly buffer LinkOffsets {
+    uint data[];
+} link_offsets;
+
+#define LINKS_START(ID) \
+    link_offsets.data[ID]
+
+#define LINKS_COUNT_AT(ID, START) \
+    (link_offsets.data[ID + 1] - START)
+
+#define GET_LINK_AT(START, I) \
+    links.data[START + I]
+
+#define LINKS_COUNT(ID) \
+    LINKS_COUNT_AT(ID, LINKS_START(ID))
+
+#define GET_LINK(ID, I) \
+    GET_LINK_AT(LINKS_START(ID), I)
+
+#else
+
 #define LINKS_CONTAINER_OFFSET(ID) \
     ID * (LINKS_CAPACITY + 1)
 
+#define LINKS_START(ID) \
+    (LINKS_CONTAINER_OFFSET(ID) + 1)
+
+#define LINKS_COUNT_AT(ID, START) \
+    links.data[START - 1]
+
+#define GET_LINK_AT(START, I) \
+    links.data[START + I]
+
 #define LINKS_COUNT(ID) \
-    links.data[LINKS_CONTAINER_OFFSET(ID)]
+    LINKS_COUNT_AT(ID, LINKS_START(ID))
 
 #define GET_LINK(ID, I) \
-    links.data[LINKS_CONTAINER_OFFSET(ID) + 1 + I]
+    GET_LINK_AT(LINKS_START(ID), I)
 
 #define LINKS_SET_SIZE(ID, SIZE) \
     links.data[LINKS_CONTAINER_OFFSET(ID)] = SIZE
+
+#endif
 
 #endif
