@@ -106,6 +106,7 @@ impl GpuFilteredGraphSearchContext {
         let mut links = GpuLinks::new(device.clone(), graph.get_m(0), max_links, point_count)?;
         let mut upload_context = gpu::Context::new(device.clone())?;
         links.upload_graph_layer(0, graph, point_count, &mut upload_context, stopped)?;
+        links.release_patch_buffer()?;
         let links = Arc::new(links);
 
         Self::new_with_resources(device, vector_storage, links, point_count, ef, 0)

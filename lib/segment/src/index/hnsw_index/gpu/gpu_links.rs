@@ -30,7 +30,7 @@ pub struct GpuLinks {
     device: Arc<gpu::Device>,
     links_buffer: Arc<gpu::Buffer>,
     params_buffer: Arc<gpu::Buffer>,
-    patch_buffer: Arc<gpu::Buffer>,
+    patch_buffer: Option<Arc<gpu::Buffer>>,
     patched_points: Vec<(PointOffsetType, usize)>,
     descriptor_set_layout: Arc<gpu::DescriptorSetLayout>,
     descriptor_set: Arc<gpu::DescriptorSet>,
@@ -135,7 +135,7 @@ impl GpuLinks {
             device,
             links_buffer,
             params_buffer,
-            patch_buffer,
+            patch_buffer: Some(patch_buffer),
             patched_points: vec![],
             descriptor_set_layout,
             descriptor_set,
@@ -156,10 +156,11 @@ impl GpuLinks {
         let links_patch_capacity = self.max_patched_points
             * (self.links_capacity + 1)
             * std::mem::size_of::<PointOffsetType>();
-        self.patch_buffer.upload(&params, links_patch_capacity)?;
+        let patch_buffer = self.patch_buffer()?;
+        patch_buffer.upload(&params, links_patch_capacity)?;
 
         gpu_context.copy_gpu_buffer(
-            self.patch_buffer.clone(),
+            patch_buffer,
             self.params_buffer.clone(),
             links_patch_capacity,
             0,
@@ -167,6 +168,19 @@ impl GpuLinks {
         )?;
         gpu_context.run()?;
         gpu_context.wait_finish(GPU_TIMEOUT)?;
+        Ok(())
+    }
+
+    /// Release the CPU-to-GPU transfer buffer after an immutable graph has
+    /// been uploaded. Query shaders retain only the resident links and params
+    /// buffers, so the staging allocation is not needed by the search cache.
+    pub fn release_patch_buffer(&mut self) -> OperationResult<()> {
+        if !self.patched_points.is_empty() {
+            return Err(OperationError::service_error(
+                "Cannot release GPU links patch buffer with pending patches",
+            ));
+        }
+        self.patch_buffer = None;
         Ok(())
     }
 
@@ -352,6 +366,7 @@ impl GpuLinks {
     }
 
     fn apply_gpu_patches(&mut self, gpu_context: &mut gpu::Context) -> OperationResult<()> {
+        let patch_buffer = self.patch_buffer()?;
         for (i, &(patched_point_id, patched_links_count)) in self.patched_points.iter().enumerate()
         {
             let patch_start_index =
@@ -361,7 +376,7 @@ impl GpuLinks {
                 * (self.links_capacity + 1)
                 * std::mem::size_of::<PointOffsetType>();
             gpu_context.copy_gpu_buffer(
-                self.patch_buffer.clone(),
+                patch_buffer.clone(),
                 self.links_buffer.clone(),
                 patch_start_index,
                 links_start_index,
@@ -384,12 +399,18 @@ impl GpuLinks {
         let mut patch_start_index = self.patched_points.len()
             * (self.links_capacity + 1)
             * std::mem::size_of::<PointOffsetType>();
-        self.patch_buffer
-            .upload(&(links.len() as u32), patch_start_index)?;
+        let patch_buffer = self.patch_buffer()?;
+        patch_buffer.upload(&(links.len() as u32), patch_start_index)?;
         patch_start_index += std::mem::size_of::<PointOffsetType>();
-        self.patch_buffer.upload(links, patch_start_index)?;
+        patch_buffer.upload(links, patch_start_index)?;
         self.patched_points.push((point_id, links.len()));
 
         Ok(())
+    }
+
+    fn patch_buffer(&self) -> OperationResult<Arc<gpu::Buffer>> {
+        self.patch_buffer.clone().ok_or_else(|| {
+            OperationError::service_error("GPU links patch buffer has already been released")
+        })
     }
 }
