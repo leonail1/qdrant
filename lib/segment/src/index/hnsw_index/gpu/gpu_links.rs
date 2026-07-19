@@ -199,7 +199,11 @@ impl GpuLinks {
             gpu::BufferType::Storage,
             links_bytes,
         )?;
-        let offsets_buffer = gpu::Buffer::new(
+        // Keep the long-lived offsets out of the shared 256 MiB allocator
+        // blocks. At SIFT1M this 4 MiB buffer otherwise prevents two 128 MB
+        // vector shards from sharing a block and strands almost an entire
+        // device-memory block for the lifetime of the cache.
+        let offsets_buffer = gpu::Buffer::new_dedicated(
             device.clone(),
             "Compact links offsets",
             gpu::BufferType::Storage,

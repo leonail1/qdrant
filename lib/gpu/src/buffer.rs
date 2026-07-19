@@ -62,6 +62,30 @@ impl Buffer {
         buffer_type: BufferType,
         size: usize,
     ) -> GpuResult<Arc<Self>> {
+        Self::new_with_allocation_scheme(device, name, buffer_type, size, false)
+    }
+
+    /// Create a buffer backed by its own Vulkan memory allocation.
+    ///
+    /// This is useful for long-lived buffers whose size would otherwise disturb
+    /// the packing of large neighboring buffers in the allocator's shared
+    /// blocks. It should not be used for short-lived or numerous small buffers.
+    pub fn new_dedicated(
+        device: Arc<Device>,
+        name: impl AsRef<str>,
+        buffer_type: BufferType,
+        size: usize,
+    ) -> GpuResult<Arc<Self>> {
+        Self::new_with_allocation_scheme(device, name, buffer_type, size, true)
+    }
+
+    fn new_with_allocation_scheme(
+        device: Arc<Device>,
+        name: impl AsRef<str>,
+        buffer_type: BufferType,
+        size: usize,
+        dedicated: bool,
+    ) -> GpuResult<Arc<Self>> {
         if size == 0 {
             return Err(GpuError::NotSupported(
                 "Zero-sized GPU buffers are not supported".to_string(),
@@ -113,12 +137,17 @@ impl Buffer {
         // Allocate memory for the buffer.
         let buffer_allocation_requirements =
             unsafe { device.vk_device().get_buffer_memory_requirements(vk_buffer) };
+        let allocation_scheme = if dedicated {
+            AllocationScheme::DedicatedBuffer(vk_buffer)
+        } else {
+            AllocationScheme::GpuAllocatorManaged
+        };
         let allocation_result = device.allocate(&AllocationCreateDesc {
             name: &name,
             requirements: buffer_allocation_requirements,
             location,
             linear: true, // Buffers are always linear.
-            allocation_scheme: AllocationScheme::GpuAllocatorManaged,
+            allocation_scheme,
         });
 
         // Check if the allocation was successful.
